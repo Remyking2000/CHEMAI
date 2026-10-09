@@ -1,34 +1,14 @@
 {
-  "name": "chemai",
+  "name": "chemai-workspace",
+  "version": "1.0.0",
   "private": true,
-  "version": "0.0.0",
-  "type": "module",
+  "description": "ChemAI - AI Chemistry Assistant with Ketcher & PubChem integration",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "lint": "eslint .",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "ketcher-core": "^3.7.0",
-    "ketcher-react": "^3.7.0",
-    "ketcher-standalone": "^3.10.0-build.1",
-    "openchemlib": "^9.11.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-router-dom": "^7.9.3"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.36.0",
-    "@tailwindcss/vite": "^4.1.14",
-    "@types/react": "^19.1.16",
-    "@types/react-dom": "^19.1.9",
-    "@vitejs/plugin-react": "^5.0.4",
-    "eslint": "^9.36.0",
-    "eslint-plugin-react-hooks": "^5.2.0",
-    "eslint-plugin-react-refresh": "^0.4.22",
-    "globals": "^16.4.0",
-    "tailwindcss": "^4.1.14",
-    "vite": "^7.1.7"
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": "npm run dev --prefix backend",
+    "start:backend": "npm run start --prefix backend",
+    "build:frontend": "npm run build --prefix frontend",
+    "lint:frontend": "npm run lint --prefix frontend",
+    "install:all": "npm install --prefix frontend && npm install --prefix backend"
   }
 }

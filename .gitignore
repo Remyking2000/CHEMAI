@@ -23,15 +23,18 @@ dist-ssr/
 *.env.*
 !*.env.example
 
-# Cache
-cache/
-**/cache/
+# Cache files (keep directory structure with .gitkeep)
+backend/cache/pubchem_images/*
+!backend/cache/pubchem_images/.gitkeep
+backend/cache/pubchem_json/*
+!backend/cache/pubchem_json/.gitkeep
 
 # Editor directories and OS files
 .vscode/*
 !.vscode/extensions.json
 .idea/
 .DS_Store
+Thumbs.db
 *.suo
 *.ntvs*
 *.njsproj
