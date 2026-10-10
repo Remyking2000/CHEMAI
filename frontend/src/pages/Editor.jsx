@@ -4,6 +4,7 @@ import { Editor } from "ketcher-react";
 import { StandaloneStructServiceProvider } from "ketcher-standalone";
 import OCL from "openchemlib";
 import "ketcher-react/dist/index.css";
+import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
 
 // Instantiate the standalone Indigo struct service provider once
 const structServiceProvider = new StandaloneStructServiceProvider();
@@ -31,6 +32,11 @@ export default function MolecularEditor() {
   const [identifyLoading, setIdentifyLoading] = useState(false);
   const [identifyError, setIdentifyError] = useState(null);
 
+  // Phase 2: Gemini Chemistry Explanation state
+  const [explainResult, setExplainResult] = useState(null);
+  const [explainLoading, setExplainLoading] = useState(false);
+  const [explainError, setExplainError] = useState(null);
+
   // Preserved Compound Analyzer state
   const [showAnalyzer, setShowAnalyzer] = useState(false);
   const [analyzerQuery, setAnalyzerQuery] = useState("");
@@ -57,15 +63,18 @@ export default function MolecularEditor() {
   const identifyLoadingRef = useRef(false);
   identifyLoadingRef.current = identifyLoading;
 
-  // Listen for canvas edits to clear stale identification results
+  // Listen for canvas edits to clear stale identification and explanation results
   useEffect(() => {
     if (!ketcher) return;
 
     const handleCanvasChange = () => {
-      // Clear stale identification results when user edits canvas, but not while actively loading
+      // Clear stale identification and explanation results when user edits canvas, but not while actively loading identification
       if (identifyLoadingRef.current) return;
       setIdentifyResult(null);
       setIdentifyError(null);
+      setExplainResult(null);
+      setExplainError(null);
+      setExplainLoading(false);
     };
 
     if (ketcher.changeEvent && typeof ketcher.changeEvent.add === "function") {
@@ -141,6 +150,8 @@ export default function MolecularEditor() {
     setIdentifyLoading(true);
     setIdentifyError(null);
     setIdentifyResult(null);
+    setExplainResult(null);
+    setExplainError(null);
 
     try {
       const { smiles, molfile, atomCount } = await getCurrentStructure();
@@ -216,6 +227,113 @@ export default function MolecularEditor() {
     }
   };
 
+  // Phase 2: Request Gemini chemistry explanation for the currently identified molecule
+  const handleExplainStructure = async () => {
+    if (!identifyResult || !identifyResult.cid) {
+      showStatus("Identify a molecule first to generate a chemistry explanation.");
+      return;
+    }
+
+    if (explainLoading) return; // Prevent duplicate submissions
+
+    const smilesToSubmit =
+      identifyResult.inputSmiles || identifyResult.canonicalSmiles || "";
+    if (!smilesToSubmit.trim()) {
+      setExplainError({
+        type: "invalid",
+        title: "Missing Structure SMILES",
+        message: "No valid SMILES string is available for the currently identified compound.",
+      });
+      return;
+    }
+
+    setExplainLoading(true);
+    setExplainError(null);
+    setExplainResult(null);
+
+    try {
+      const res = await fetch("http://localhost:5000/api/explain-structure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ smiles: smilesToSubmit }),
+      });
+
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { error: "Invalid JSON received from server", raw: text };
+      }
+
+      if (!res.ok) {
+        if (
+          data.configError ||
+          data.code === "GEMINI_CONFIG_MISSING" ||
+          data.code === "GEMINI_AUTH_ERROR"
+        ) {
+          setExplainError({
+            type: "config_error",
+            title: "Gemini Configuration Required",
+            message:
+              data.error || "Gemini API key is not configured on the backend server.",
+            details:
+              data.details ||
+              "Set GEMINI_API_KEY in backend/.env (see backend/.env.example) and restart the backend server.",
+            code: data.code,
+          });
+        } else if (res.status === 404 || data.code === "UNIDENTIFIED_COMPOUND") {
+          setExplainError({
+            type: "unidentified",
+            title: "Identified Compound Required",
+            message:
+              data.error ||
+              "This phase supports chemistry explanations for identified PubChem compounds only.",
+            details: data.details,
+          });
+        } else if (res.status === 429 || data.code === "GEMINI_RATE_LIMIT") {
+          setExplainError({
+            type: "rate_limit",
+            title: "Gemini Rate Limit Reached",
+            message:
+              data.error ||
+              "Gemini API rate limit or quota reached. Please wait a moment and try again.",
+          });
+        } else if (res.status === 504 || data.code === "GEMINI_TIMEOUT") {
+          setExplainError({
+            type: "timeout",
+            title: "Explanation Request Timed Out",
+            message:
+              data.error ||
+              "The Gemini explanation request timed out. Please try again shortly.",
+          });
+        } else {
+          setExplainError({
+            type: "service_error",
+            title: "Explanation Service Error",
+            message:
+              data.error ||
+              "Unable to generate chemistry explanation from the Gemini service.",
+            details: data.details,
+          });
+        }
+      } else {
+        setExplainResult(data);
+        showStatus(`Generated chemistry explanation for ${identifyResult.name}!`);
+      }
+    } catch (err) {
+      console.error("Explain structure fetch error:", err);
+      setExplainError({
+        type: "network_error",
+        title: "Connection Failed",
+        message:
+          "Could not connect to the CHEMAI backend server (http://localhost:5000). Please ensure the backend is running.",
+      });
+    } finally {
+      setExplainLoading(false);
+    }
+  };
+
   // Export current molecular structure
   const handleExportStructure = async () => {
     if (!ketcher) {
@@ -283,6 +401,8 @@ export default function MolecularEditor() {
       setExportData(null);
       setIdentifyResult(null);
       setIdentifyError(null);
+      setExplainResult(null);
+      setExplainError(null);
       showStatus("Structure canvas cleared.");
     } catch (err) {
       console.error("Failed to clear structure:", err);
@@ -291,6 +411,8 @@ export default function MolecularEditor() {
         setExportData(null);
         setIdentifyResult(null);
         setIdentifyError(null);
+        setExplainResult(null);
+        setExplainError(null);
         showStatus("Structure canvas cleared.");
       } catch (e) {
         console.error("Fallback clear failed:", e);
@@ -302,9 +424,11 @@ export default function MolecularEditor() {
   const handleLoadSample = async (smiles, name) => {
     if (!ketcher) return;
     try {
-      // Clear previous identification results
+      // Clear previous identification and explanation results
       setIdentifyResult(null);
       setIdentifyError(null);
+      setExplainResult(null);
+      setExplainError(null);
       await ketcher.setMolecule(smiles);
       showStatus(`Loaded ${name} onto canvas.`);
       // Auto-refresh export if currently viewing
@@ -382,6 +506,8 @@ export default function MolecularEditor() {
     try {
       setIdentifyResult(null);
       setIdentifyError(null);
+      setExplainResult(null);
+      setExplainError(null);
       await ketcher.setMolecule(smiles);
       showStatus(`Imported ${analyzerResult?.compound || "compound"} into Editor!`);
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -539,6 +665,23 @@ export default function MolecularEditor() {
               </div>
 
               <div className="flex items-center gap-3">
+                <button
+                  onClick={handleExplainStructure}
+                  disabled={!identifyResult?.cid || explainLoading}
+                  className="px-3.5 py-1.5 text-xs sm:text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 active:bg-violet-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                  title="Generate a beginner-friendly chemistry explanation using Gemini AI"
+                >
+                  {explainLoading ? (
+                    <>
+                      <span className="animate-spin text-xs">⏳</span> Explaining...
+                    </>
+                  ) : (
+                    <>
+                      <ChemAINeuralHexIcon className="w-4 h-4 text-violet-100" />
+                      <span>Explain Structure</span>
+                    </>
+                  )}
+                </button>
                 <a
                   href={`https://pubchem.ncbi.nlm.nih.gov/compound/${identifyResult.cid}`}
                   target="_blank"
@@ -549,7 +692,11 @@ export default function MolecularEditor() {
                   <span>↗</span>
                 </a>
                 <button
-                  onClick={() => setIdentifyResult(null)}
+                  onClick={() => {
+                    setIdentifyResult(null);
+                    setExplainResult(null);
+                    setExplainError(null);
+                  }}
                   className="text-gray-400 hover:text-gray-600 text-sm p-1 cursor-pointer"
                   title="Close identification results"
                 >
@@ -642,6 +789,174 @@ export default function MolecularEditor() {
                         {syn}
                       </span>
                     ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Phase 2: Gemini Chemistry Explanation Loading State */}
+              {explainLoading && (
+                <div className="mt-4 bg-violet-50/70 border border-violet-200 rounded-xl p-5 flex items-center gap-4">
+                  <div className="w-8 h-8 border-3 border-violet-600 border-t-transparent rounded-full animate-spin shrink-0"></div>
+                  <div>
+                    <h4 className="text-sm font-bold text-violet-950">
+                      Generating Gemini Chemistry Explanation...
+                    </h4>
+                    <p className="text-xs text-violet-700 mt-0.5">
+                      Analyzing verified PubChem structure ({identifyResult.name}, {identifyResult.molecularFormula}) for functional groups, bonding, and educational insights.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Phase 2: Gemini Explanation Error / Configuration Notice */}
+              {explainError && (
+                <div
+                  className={`mt-4 rounded-xl p-5 border flex items-start justify-between gap-4 ${
+                    explainError.type === "config_error"
+                      ? "bg-amber-50/90 border-amber-300"
+                      : "bg-red-50/90 border-red-300"
+                  }`}
+                >
+                  <div className="flex items-start gap-3.5">
+                    <div
+                      className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-base shrink-0 ${
+                        explainError.type === "config_error"
+                          ? "bg-amber-100 text-amber-800"
+                          : "bg-red-100 text-red-700"
+                      }`}
+                    >
+                      {explainError.type === "config_error" ? "🔑" : "⚠️"}
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-bold text-gray-900">
+                        {explainError.title || "Explanation Unavailable"}
+                      </h4>
+                      <p className="text-sm text-gray-800 mt-0.5">
+                        {explainError.message}
+                      </p>
+                      {explainError.details && (
+                        <p className="text-xs text-gray-600 mt-1.5 font-mono bg-white/80 px-2.5 py-1.5 rounded border border-gray-200">
+                          {explainError.details}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setExplainError(null)}
+                    className="text-gray-400 hover:text-gray-600 text-sm cursor-pointer"
+                    title="Dismiss explanation notice"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Phase 2: Gemini Chemistry Explanation Panel */}
+              {explainResult && explainResult.explanation && (
+                <div className="mt-4 bg-gradient-to-br from-violet-50/60 via-white to-indigo-50/40 rounded-xl border-2 border-violet-200 overflow-hidden shadow-xs">
+                  {/* Panel Header */}
+                  <div className="bg-violet-100/70 px-5 py-3 border-b border-violet-200 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <ChemAINeuralHexIcon className="w-5 h-5 text-violet-700" />
+                      <h3 className="text-sm font-bold text-violet-950">
+                        Gemini Chemistry Explanation Assistant
+                      </h3>
+                      <span className="text-xs bg-violet-200/80 text-violet-900 px-2 py-0.5 rounded-full font-mono font-medium">
+                        {explainResult.model || "gemini-2.5-flash"}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs bg-white text-gray-600 px-2.5 py-0.5 rounded-full border border-violet-200 font-medium">
+                        Educational Interpretation (Verify Independently)
+                      </span>
+                      <button
+                        onClick={() => setExplainResult(null)}
+                        className="text-gray-400 hover:text-gray-600 text-sm p-1 cursor-pointer"
+                        title="Close explanation panel"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Distinction Banner: Reference Data vs AI Interpretation */}
+                  <div className="px-5 py-2.5 bg-indigo-50/70 border-b border-violet-100 text-xs text-indigo-950 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <span className="font-bold uppercase tracking-wider text-indigo-700 mr-1.5">
+                        Verified PubChem Reference:
+                      </span>
+                      <span className="font-semibold">{explainResult.referenceData?.name || identifyResult.name}</span>
+                      {" · "}
+                      <span className="font-mono">CID {explainResult.referenceData?.cid || identifyResult.cid}</span>
+                      {" · "}
+                      <span className="font-mono">{explainResult.referenceData?.molecularFormula || identifyResult.molecularFormula}</span>
+                      {" · "}
+                      <span className="font-mono">{explainResult.referenceData?.molecularWeight || identifyResult.molecularWeight} g/mol</span>
+                    </div>
+                    <span className="text-[11px] text-indigo-700 font-medium">
+                      Source: PubChem PUG REST
+                    </span>
+                  </div>
+
+                  {/* Structured Educational Sections */}
+                  <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-white p-4 rounded-lg border border-gray-200 md:col-span-2">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
+                        1. What This Compound Is
+                      </h4>
+                      <p className="text-sm text-gray-800 leading-relaxed">
+                        {explainResult.explanation.whatItIs}
+                      </p>
+                    </div>
+
+                    <div className="bg-white p-4 rounded-lg border border-gray-200">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
+                        2. Formula & Basic Structural Features
+                      </h4>
+                      <p className="text-sm text-gray-800 leading-relaxed">
+                        {explainResult.explanation.formulaAndStructure}
+                      </p>
+                    </div>
+
+                    <div className="bg-white p-4 rounded-lg border border-gray-200">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
+                        3. Functional Groups & Their Roles
+                      </h4>
+                      <p className="text-sm text-gray-800 leading-relaxed">
+                        {explainResult.explanation.functionalGroups}
+                      </p>
+                    </div>
+
+                    <div className="bg-white p-4 rounded-lg border border-gray-200">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
+                        4. Bonding & Structural Characteristics
+                      </h4>
+                      <p className="text-sm text-gray-800 leading-relaxed">
+                        {explainResult.explanation.bondingAndCharacteristics}
+                      </p>
+                    </div>
+
+                    <div className="bg-white p-4 rounded-lg border border-gray-200">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
+                        5. Why These Features Matter
+                      </h4>
+                      <p className="text-sm text-gray-800 leading-relaxed">
+                        {explainResult.explanation.whyItMatters}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Verification & Uncertainty Disclaimer Footer */}
+                  <div className="px-5 py-3 bg-amber-50/70 border-t border-amber-200 text-xs text-amber-900 space-y-1">
+                    <p>
+                      <span className="font-bold">⚠️ Verification Note: </span>
+                      {explainResult.explanation.uncertaintyAndVerificationNote}
+                    </p>
+                    {explainResult.disclaimer && (
+                      <p className="text-[11px] text-amber-800">
+                        {explainResult.disclaimer}
+                      </p>
+                    )}
                   </div>
                 </div>
               )}

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="50%" stop-color="#1e1b4b" />
+      <stop offset="100%" stop-color="#090d16" />
+    </linearGradient>
+    <linearGradient id="chemGrad" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee" />
+      <stop offset="50%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#8b5cf6" />
+    </linearGradient>
+    <linearGradient id="nodeGlow" x1="16" y1="16" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#22d3ee" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded Squircle Badge -->
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#bgGrad)" stroke="url(#chemGrad)" stroke-width="2.5" />
+
+  <!-- Outer Orbital Ring -->
+  <ellipse cx="32" cy="34" rx="23" ry="9" transform="rotate(-28 32 34)" stroke="url(#chemGrad)" stroke-width="1.5" stroke-opacity="0.45" stroke-dasharray="3 2" />
+
+  <!-- Flask Neck + Neural Circuit Stem -->
+  <path d="M26 11H38M29 11V19L15 43C13.5 45.6 15.4 49 18.5 49H45.5C48.6 49 50.5 45.6 49 43L35 19V11" stroke="url(#chemGrad)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Inner Benzene Hexagon + AI Neural Core inside Flask -->
+  <polygon points="32,24 41,29.2 41,39.6 32,44.8 23,39.6 23,29.2" fill="#0f172a" fill-opacity="0.85" stroke="url(#nodeGlow)" stroke-width="2.2" stroke-linejoin="round" />
+
+  <!-- AI Neural Synapse Traces from Center Core to Hexagon Vertices -->
+  <line x1="32" y1="34.4" x2="32" y2="24" stroke="#22d3ee" stroke-width="1.6" />
+  <line x1="32" y1="34.4" x2="41" y2="29.2" stroke="#38bdf8" stroke-width="1.6" />
+  <line x1="32" y1="34.4" x2="41" y2="39.6" stroke="#818cf8" stroke-width="1.6" />
+  <line x1="32" y1="34.4" x2="23" y2="39.6" stroke="#34d399" stroke-width="1.6" />
+  <line x1="32" y1="34.4" x2="23" y2="29.2" stroke="#22d3ee" stroke-width="1.6" />
+
+  <!-- Central AI Processor Nucleus -->
+  <circle cx="32" cy="34.4" r="4" fill="url(#nodeGlow)" />
+  <circle cx="32" cy="34.4" r="1.8" fill="#0f172a" />
+
+  <!-- Covalent / Neural Vertex Nodes -->
+  <circle cx="32" cy="24" r="2.3" fill="#22d3ee" />
+  <circle cx="41" cy="29.2" r="2.3" fill="#38bdf8" />
+  <circle cx="41" cy="39.6" r="2.3" fill="#818cf8" />
+  <circle cx="32" cy="44.8" r="2.3" fill="#a78bfa" />
+  <circle cx="23" cy="39.6" r="2.3" fill="#34d399" />
+  <circle cx="23" cy="29.2" r="2.3" fill="#22d3ee" />
+</svg>
