@@ -1,13 +1,37 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { Editor } from "ketcher-react";
+import { ketcherProvider } from "ketcher-core";
 import { StandaloneStructServiceProvider } from "ketcher-standalone";
 import OCL from "openchemlib";
 import "ketcher-react/dist/index.css";
 import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
 
-// Instantiate the standalone Indigo struct service provider once
-const structServiceProvider = new StandaloneStructServiceProvider();
+// Ensure KetcherLogger has a safe fallback before Ketcher finishes async initialization
+if (typeof window !== "undefined" && !window.ketcher) {
+  window.ketcher = {
+    logging: { enabled: false },
+    eventBus: { addListener: () => {}, removeListener: () => {} },
+    editor: { serverSettings: {} },
+  };
+}
+
+// Safeguard ketcherProvider.getKetcher against async unmount/remount race conditions on route changes
+if (ketcherProvider && !ketcherProvider.__chemaiPatched) {
+  const originalGetKetcher = ketcherProvider.getKetcher.bind(ketcherProvider);
+  ketcherProvider.getKetcher = function (id) {
+    try {
+      return originalGetKetcher(id);
+    } catch {
+      if (this.ketcherInstances && this.ketcherInstances.size > 0) {
+        const instances = Array.from(this.ketcherInstances.values());
+        return instances[instances.length - 1];
+      }
+      return window.ketcher;
+    }
+  };
+  ketcherProvider.__chemaiPatched = true;
+}
 
 // Quick example templates to test and draw
 const SAMPLE_STRUCTURES = [
@@ -18,6 +42,10 @@ const SAMPLE_STRUCTURES = [
 ];
 
 export default function MolecularEditor() {
+  const structServiceProvider = useMemo(
+    () => new StandaloneStructServiceProvider(),
+    []
+  );
   const [ketcher, setKetcher] = useState(null);
   const [isEditorReady, setIsEditorReady] = useState(false);
   const [editorError, setEditorError] = useState(null);
