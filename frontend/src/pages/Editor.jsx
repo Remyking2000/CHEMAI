@@ -65,6 +65,21 @@ export default function MolecularEditor() {
   const [explainLoading, setExplainLoading] = useState(false);
   const [explainError, setExplainError] = useState(null);
 
+  // Phase 3A: Reverse Structure Lookup (Build Structure) state
+  const [showBuildStructure, setShowBuildStructure] = useState(true);
+  const [buildQuery, setBuildQuery] = useState("");
+  const [buildType, setBuildType] = useState("auto"); // "auto" | "name" | "formula"
+  const [buildLoading, setBuildLoading] = useState(false);
+  const [buildResult, setBuildResult] = useState(null);
+  const [buildError, setBuildError] = useState(null);
+  const [selectedCandidateCid, setSelectedCandidateCid] = useState(null);
+
+  // Phase 3B: AI-Assisted Structure Generation state
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiCandidate, setAiCandidate] = useState(null);
+  const [aiError, setAiError] = useState(null);
+  const [aiApproved, setAiApproved] = useState(false);
+
   // Preserved Compound Analyzer state
   const [showAnalyzer, setShowAnalyzer] = useState(false);
   const [analyzerQuery, setAnalyzerQuery] = useState("");
@@ -556,6 +571,363 @@ export default function MolecularEditor() {
     }
   };
 
+  // Phase 3A: Validate SMILES syntax using OpenChemLib before sending to Ketcher
+  const validateSmiles = (smiles) => {
+    if (!smiles || typeof smiles !== "string" || !smiles.trim()) {
+      return { valid: false, error: "Empty or missing SMILES string." };
+    }
+    try {
+      const mol = OCL.Molecule.fromSmiles(smiles.trim());
+      if (!mol || mol.getAllAtoms() === 0) {
+        return { valid: false, error: "Parsed structure contains 0 atoms." };
+      }
+      return { valid: true, atomCount: mol.getAllAtoms() };
+    } catch (err) {
+      return {
+        valid: false,
+        error: err?.message || "Invalid SMILES syntax according to OpenChemLib parser.",
+      };
+    }
+  };
+
+  // Phase 3A: Reverse Structure Lookup (search PubChem by compound name or molecular formula)
+  const handleLookupStructure = async (queryOverride, typeOverride) => {
+    const q = (queryOverride !== undefined ? queryOverride : buildQuery).trim();
+    const t = typeOverride !== undefined ? typeOverride : buildType;
+
+    if (!q) {
+      setBuildError({
+        type: "empty",
+        title: "Input Required",
+        message:
+          "Please enter a chemical compound name (e.g. ethanol, aspirin) or molecular formula (e.g. C2H6O, C6H6).",
+      });
+      return;
+    }
+
+    if (queryOverride !== undefined) {
+      setBuildQuery(queryOverride);
+    }
+    if (typeOverride !== undefined) {
+      setBuildType(typeOverride);
+    }
+
+    setBuildLoading(true);
+    setBuildError(null);
+    setBuildResult(null);
+    setSelectedCandidateCid(null);
+
+    try {
+      const res = await fetch("http://localhost:5000/api/lookup-structure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q, type: t }),
+      });
+
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { error: "Invalid JSON received from server", raw: text };
+      }
+
+      if (!res.ok) {
+        if (res.status === 400) {
+          setBuildError({
+            type: "invalid",
+            title:
+              data.code === "INVALID_FORMULA"
+                ? "Invalid Molecular Formula"
+                : "Invalid Input",
+            message:
+              data.error ||
+              "The query could not be processed as a valid formula or name.",
+            details: data.details,
+            code: data.code,
+          });
+        } else if (res.status === 404) {
+          setBuildError({
+            type: "not_found",
+            title: "No Matching Compounds Found",
+            message:
+              data.error || `No compounds found in PubChem matching "${q}".`,
+            details:
+              data.details ||
+              "Check the spelling or try searching by an alternative common or IUPAC name, or standard Hill molecular formula.",
+            code: data.code,
+          });
+        } else if (res.status === 503 || res.status === 504) {
+          setBuildError({
+            type: "unavailable",
+            title: "PubChem Service Busy or Timed Out",
+            message:
+              data.error ||
+              "PubChem lookup is temporarily unavailable. Please try again shortly.",
+            details: data.details,
+            code: data.code,
+          });
+        } else {
+          setBuildError({
+            type: "server_error",
+            title: "Structure Lookup Error",
+            message: data.error || "An error occurred during structure lookup.",
+            details: data.details,
+            code: data.code,
+          });
+        }
+      } else {
+        setBuildResult(data);
+        if (data.candidates && data.candidates.length > 0) {
+          setSelectedCandidateCid(data.candidates[0].cid);
+          showStatus(
+            `Found ${data.count || data.candidates.length} candidate${
+              (data.count || data.candidates.length) > 1 ? "s" : ""
+            } for "${data.query}"`
+          );
+        } else {
+          setBuildError({
+            type: "not_found",
+            title: "No Usable Structures Found",
+            message:
+              "The search succeeded but returned no candidate structures with valid SMILES.",
+          });
+        }
+      }
+    } catch (err) {
+      console.error("Lookup structure error:", err);
+      setBuildError({
+        type: "network_error",
+        title: "Connection Failed",
+        message:
+          "Could not connect to the CHEMAI backend server (http://localhost:5000). Please ensure the backend is running.",
+      });
+    } finally {
+      setBuildLoading(false);
+    }
+  };
+
+  // Phase 3A: Load candidate structure into Ketcher canvas
+  const handleLoadCandidateToEditor = async (candidate) => {
+    if (!ketcher) {
+      showStatus("Editor is still initializing, please wait.");
+      return;
+    }
+    if (!candidate || !candidate.smiles) {
+      showStatus("Selected candidate has no SMILES representation.");
+      return;
+    }
+
+    // Requirement 6: Validate that the returned SMILES is parseable before loading it
+    const validation = validateSmiles(candidate.smiles);
+    if (!validation.valid) {
+      setBuildError({
+        type: "invalid_smiles",
+        title: "Unparseable Structure SMILES",
+        message: `The SMILES string for "${
+          candidate.name || "CID " + candidate.cid
+        }" could not be parsed: ${validation.error}`,
+        details: `Candidate SMILES: ${candidate.smiles}`,
+      });
+      return;
+    }
+
+    try {
+      // Requirement 7: After loading, clear stale identification and explanation results
+      setIdentifyResult(null);
+      setIdentifyError(null);
+      setExplainResult(null);
+      setExplainError(null);
+      setExportData(null);
+
+      setSelectedCandidateCid(candidate.cid);
+
+      await ketcher.setMolecule(candidate.smiles);
+      showStatus(
+        `Loaded "${
+          candidate.name || "Candidate CID " + candidate.cid
+        }" onto Canvas!`
+      );
+
+      // Smooth scroll to canvas
+      const canvasEl = document.getElementById("ketcher-canvas-card");
+      if (canvasEl) {
+        canvasEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    } catch (err) {
+      console.error("Failed to load candidate structure into Ketcher:", err);
+      setBuildError({
+        type: "load_failed",
+        title: "Failed to Load Structure into Ketcher",
+        message:
+          err?.message || "Ketcher could not render the candidate structure.",
+        details: `SMILES: ${candidate.smiles}`,
+      });
+    }
+  };
+
+  // Phase 3B: Request AI-generated structure hypothesis via POST /api/generate-structure
+  const handleGenerateStructure = async (queryOverride) => {
+    const q = (queryOverride !== undefined ? queryOverride : buildQuery).trim();
+    if (!q) {
+      setAiError({
+        type: "empty",
+        title: "Input Required",
+        message: "Please enter a compound name or molecular formula for AI structure generation.",
+      });
+      return;
+    }
+
+    if (queryOverride !== undefined) {
+      setBuildQuery(queryOverride);
+    }
+
+    if (aiLoading) return; // Prevent duplicate requests while in flight
+
+    setAiLoading(true);
+    setAiError(null);
+    setAiCandidate(null);
+    setAiApproved(false);
+
+    try {
+      const res = await fetch("http://localhost:5000/api/generate-structure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q }),
+      });
+
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { error: "Invalid JSON received from server", raw: text };
+      }
+
+      if (!res.ok) {
+        if (data.code === "AI_CONFIG_MISSING" || res.status === 503) {
+          setAiError({
+            type: "config_error",
+            title: "AI Configuration Required",
+            message: data.error || "AI service is not configured on the backend.",
+            details: data.details || "Add a valid OPENROUTER_API_KEY in backend/.env.",
+            code: data.code,
+          });
+        } else if (data.code === "AI_INVALID_SMILES" || res.status === 422) {
+          setAiError({
+            type: "invalid_smiles",
+            title: "Invalid Generated Structure",
+            message: data.error || "The AI generated an unparseable molecular structure.",
+            details: data.details,
+            proposedSmiles: data.proposedSmiles,
+            code: data.code,
+          });
+        } else if (data.code === "AI_CREDITS_DEPLETED" || res.status === 402) {
+          setAiError({
+            type: "credits_depleted",
+            title: "AI Credits Depleted",
+            message: data.error || "AI service credits or balance depleted.",
+            details: data.details,
+            code: data.code,
+          });
+        } else if (data.code === "AI_RATE_LIMIT" || res.status === 429) {
+          setAiError({
+            type: "rate_limit",
+            title: "AI Rate Limit Reached",
+            message: data.error || "Rate limit reached. Please wait a moment and try again.",
+            details: data.details,
+            code: data.code,
+          });
+        } else if (data.code === "AI_TIMEOUT" || res.status === 504) {
+          setAiError({
+            type: "timeout",
+            title: "Request Timed Out",
+            message: data.error || "AI structure generation request timed out. Please try again.",
+            code: data.code,
+          });
+        } else {
+          setAiError({
+            type: "server_error",
+            title: "Generation Error",
+            message: data.error || "Failed to generate molecular structure.",
+            details: data.details,
+            code: data.code,
+          });
+        }
+      } else {
+        setAiCandidate(data.candidate);
+        setAiApproved(false);
+        showStatus(`AI proposed structure candidate for "${data.candidate?.proposedName || q}". Review before loading.`);
+      }
+    } catch (err) {
+      console.error("Generate structure error:", err);
+      setAiError({
+        type: "network_error",
+        title: "Connection Failed",
+        message: "Could not connect to CHEMAI backend server (http://localhost:5000).",
+      });
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  // Phase 3B: Explicit approval to load AI candidate into Ketcher
+  const handleApproveAndLoadAiCandidate = async () => {
+    if (!ketcher) {
+      showStatus("Editor is still initializing, please wait.");
+      return;
+    }
+    if (!aiCandidate || !aiCandidate.smiles) return;
+
+    // Validate SMILES before loading
+    const validation = validateSmiles(aiCandidate.smiles);
+    if (!validation.valid) {
+      setAiError({
+        type: "invalid_smiles",
+        title: "Unparseable Structure SMILES",
+        message: `The SMILES string cannot be loaded: ${validation.error}`,
+        details: `SMILES: ${aiCandidate.smiles}`,
+      });
+      return;
+    }
+
+    try {
+      // Clear previous identification and explanation states
+      setIdentifyResult(null);
+      setIdentifyError(null);
+      setExplainResult(null);
+      setExplainError(null);
+      setExportData(null);
+
+      setAiApproved(true);
+
+      await ketcher.setMolecule(aiCandidate.smiles);
+      showStatus(`Approved & loaded AI structure for "${aiCandidate.proposedName}" onto Canvas!`);
+
+      // Smooth scroll to canvas
+      const canvasEl = document.getElementById("ketcher-canvas-card");
+      if (canvasEl) {
+        canvasEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    } catch (err) {
+      console.error("Failed to load approved AI structure:", err);
+      setAiError({
+        type: "load_failed",
+        title: "Failed to Load Structure into Ketcher",
+        message: err?.message || "Ketcher could not render the AI candidate structure.",
+        details: `SMILES: ${aiCandidate.smiles}`,
+      });
+    }
+  };
+
+  // Phase 3B: Discard AI-generated candidate
+  const handleDiscardAiCandidate = () => {
+    setAiCandidate(null);
+    setAiError(null);
+    setAiApproved(false);
+    showStatus("Discarded AI-generated candidate.");
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
       {/* Top Navigation & Workspace Header */}
@@ -571,17 +943,17 @@ export default function MolecularEditor() {
               </Link>
               <span className="text-gray-300">/</span>
               <span className="text-xs font-semibold px-2 py-0.5 bg-blue-50 text-blue-700 rounded-full border border-blue-200">
-                Phase 1B
+                Phase 3B
               </span>
-              <span className="text-xs font-semibold px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-full border border-indigo-200">
-                PubChem Identification Active
+              <span className="text-xs font-semibold px-2 py-0.5 bg-violet-50 text-violet-700 rounded-full border border-violet-200">
+                AI Structure Generation Active
               </span>
             </div>
             <h1 className="text-2xl font-bold text-gray-900 mt-1">
               Molecular Structure Workspace
             </h1>
             <p className="text-sm text-gray-500">
-              Draw chemical structures, identify molecules against PubChem, and export data.
+              Draw structures, look up compounds by name or formula, identify molecules against PubChem, and explain chemistry.
             </p>
           </div>
 
@@ -629,6 +1001,19 @@ export default function MolecularEditor() {
                   <span>⬇</span> Export Structure
                 </>
               )}
+            </button>
+
+            {/* Phase 3A: Build Structure Toggle */}
+            <button
+              onClick={() => setShowBuildStructure(!showBuildStructure)}
+              className={`px-3.5 py-2 text-sm font-semibold rounded-lg border transition-all flex items-center gap-1.5 shadow-2xs cursor-pointer ${
+                showBuildStructure
+                  ? "bg-sky-50 border-sky-400 text-sky-800 ring-2 ring-sky-200"
+                  : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50 hover:text-sky-700"
+              }`}
+              title="Toggle Build Structure panel to search PubChem by name or formula"
+            >
+              <span>🏗️</span> {showBuildStructure ? "Hide Builder" : "Build Structure"}
             </button>
 
             {/* Phase 1B: Primary Action — Identify Molecule */}
@@ -1038,8 +1423,621 @@ export default function MolecularEditor() {
           </div>
         )}
 
+        {/* Phase 3A: Build Structure from Name or Molecular Formula */}
+        {showBuildStructure && (
+          <div
+            id="build-structure-panel"
+            className="bg-white rounded-xl shadow-sm border-2 border-sky-300 overflow-hidden transition-all animate-in fade-in slide-in-from-top-2 duration-200"
+          >
+            {/* Header */}
+            <div className="bg-gradient-to-r from-sky-50 via-blue-50 to-indigo-50 px-6 py-4 border-b border-sky-200 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-sky-600 text-white flex items-center justify-center font-bold text-lg shadow-sm">
+                  🏗️
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base font-bold text-gray-900">
+                      Build Structure from Name or Formula
+                    </h2>
+                    <span className="text-xs bg-sky-100 text-sky-800 px-2.5 py-0.5 rounded-full font-semibold border border-sky-200">
+                      Phase 3A
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Query PubChem by chemical compound name or molecular formula, view verified candidates, and load directly into Ketcher.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowBuildStructure(false)}
+                className="text-gray-400 hover:text-gray-600 text-sm p-1.5 rounded-lg hover:bg-white/80 transition-colors cursor-pointer"
+                title="Hide Build Structure panel"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5">
+              {/* Search Form */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleLookupStructure();
+                }}
+                className="space-y-3"
+              >
+                <div className="flex flex-col sm:flex-row gap-3">
+                  {/* Mode selector */}
+                  <div className="flex items-center bg-gray-100 p-1 rounded-lg border border-gray-200 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setBuildType("auto")}
+                      className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                        buildType === "auto"
+                          ? "bg-white text-gray-900 shadow-2xs"
+                          : "text-gray-600 hover:text-gray-900"
+                      }`}
+                    >
+                      Auto-Detect
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBuildType("name")}
+                      className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                        buildType === "name"
+                          ? "bg-white text-gray-900 shadow-2xs"
+                          : "text-gray-600 hover:text-gray-900"
+                      }`}
+                    >
+                      Compound Name
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBuildType("formula")}
+                      className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                        buildType === "formula"
+                          ? "bg-white text-gray-900 shadow-2xs"
+                          : "text-gray-600 hover:text-gray-900"
+                      }`}
+                    >
+                      Molecular Formula
+                    </button>
+                  </div>
+
+                  {/* Input field */}
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      value={buildQuery}
+                      onChange={(e) => setBuildQuery(e.target.value)}
+                      placeholder={
+                        buildType === "formula"
+                          ? "Enter molecular formula (e.g. C2H6O, C6H6, H2O, NaCl)..."
+                          : buildType === "name"
+                          ? "Enter compound name (e.g. ethanol, aspirin, caffeine)..."
+                          : "Enter compound name or formula (e.g. ethanol, C2H6O, aspirin, C6H6)..."
+                      }
+                      className="w-full pl-3.5 pr-8 py-2 text-sm border border-gray-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-sky-500 focus:border-sky-500 font-mono sm:font-sans"
+                    />
+                    {buildQuery && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBuildQuery("");
+                          setBuildResult(null);
+                          setBuildError(null);
+                        }}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs p-1 cursor-pointer"
+                        title="Clear input"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Submit Button */}
+                  <button
+                    type="submit"
+                    disabled={buildLoading || !isEditorReady}
+                    className="px-5 py-2 text-sm font-semibold text-white bg-sky-600 hover:bg-sky-700 active:bg-sky-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-sm shrink-0 cursor-pointer"
+                  >
+                    {buildLoading ? (
+                      <>
+                        <span className="animate-spin text-sm">⏳</span> Searching...
+                      </>
+                    ) : (
+                      <>
+                        <span>🔍</span> Search Structure
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* Quick Example Pills */}
+                <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
+                  <span className="text-gray-500 font-medium">Try Examples:</span>
+                  <button
+                    type="button"
+                    onClick={() => handleLookupStructure("ethanol", "name")}
+                    className="px-2.5 py-1 bg-gray-100 hover:bg-sky-100 hover:text-sky-800 rounded-md border border-gray-200 transition-colors text-gray-700 cursor-pointer"
+                  >
+                    Ethanol <span className="text-gray-400 font-mono">(Name)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLookupStructure("C2H6O", "formula")}
+                    className="px-2.5 py-1 bg-gray-100 hover:bg-sky-100 hover:text-sky-800 rounded-md border border-gray-200 transition-colors text-gray-700 font-mono cursor-pointer"
+                  >
+                    C2H6O <span className="text-gray-400 font-sans">(Isomers)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLookupStructure("aspirin", "name")}
+                    className="px-2.5 py-1 bg-gray-100 hover:bg-sky-100 hover:text-sky-800 rounded-md border border-gray-200 transition-colors text-gray-700 cursor-pointer"
+                  >
+                    Aspirin <span className="text-gray-400 font-mono">(Name)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLookupStructure("C6H6", "formula")}
+                    className="px-2.5 py-1 bg-gray-100 hover:bg-sky-100 hover:text-sky-800 rounded-md border border-gray-200 transition-colors text-gray-700 font-mono cursor-pointer"
+                  >
+                    C6H6 <span className="text-gray-400 font-sans">(Benzene, etc.)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLookupStructure("caffeine", "name")}
+                    className="px-2.5 py-1 bg-gray-100 hover:bg-sky-100 hover:text-sky-800 rounded-md border border-gray-200 transition-colors text-gray-700 cursor-pointer"
+                  >
+                    Caffeine <span className="text-gray-400 font-mono">(Name)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLookupStructure("C3H8O", "formula")}
+                    className="px-2.5 py-1 bg-gray-100 hover:bg-sky-100 hover:text-sky-800 rounded-md border border-gray-200 transition-colors text-gray-700 font-mono cursor-pointer"
+                  >
+                    C3H8O <span className="text-gray-400 font-sans">(Propanols)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleGenerateStructure()}
+                    disabled={aiLoading || !buildQuery.trim()}
+                    className="px-2.5 py-1 bg-violet-50 hover:bg-violet-100 hover:text-violet-900 text-violet-700 rounded-md border border-violet-200 transition-colors font-medium flex items-center gap-1 cursor-pointer disabled:opacity-40"
+                    title="Ask AI to propose a structure for the query currently entered"
+                  >
+                    <span>✨</span> Ask AI to Suggest Structure
+                  </button>
+                </div>
+              </form>
+
+              {/* Build Error Notice */}
+              {buildError && (
+                <div className="bg-amber-50/80 border border-amber-300 rounded-lg p-4 flex flex-col gap-3 animate-in fade-in">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-3">
+                      <span className="text-lg text-amber-600">
+                        {buildError.type === "empty"
+                          ? "✏️"
+                          : buildError.type === "not_found"
+                          ? "❓"
+                          : "⚠️"}
+                      </span>
+                      <div>
+                        <h4 className="text-sm font-bold text-amber-900">
+                          {buildError.title}
+                        </h4>
+                        <p className="text-xs text-amber-800 mt-0.5">
+                          {buildError.message}
+                        </p>
+                        {buildError.details && (
+                          <p className="text-xs text-amber-700/80 mt-1 font-mono">
+                            {buildError.details}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setBuildError(null)}
+                      className="text-amber-500 hover:text-amber-800 text-xs p-1 cursor-pointer"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  {/* Phase 3B: Explicit Ask AI CTA when PubChem does not find compound */}
+                  {buildError.type === "not_found" && (
+                    <div className="mt-1 pt-3 border-t border-amber-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="text-xs text-amber-900">
+                        <span className="font-semibold">Unindexed or novel compound?</span> Ask OpenRouter AI to formulate a molecular structure hypothesis.
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleGenerateStructure(buildQuery)}
+                        disabled={aiLoading || !buildQuery.trim()}
+                        className="px-3.5 py-1.5 bg-violet-600 hover:bg-violet-700 active:bg-violet-800 disabled:opacity-50 text-white text-xs font-semibold rounded-md shadow-2xs transition-colors flex items-center justify-center gap-1.5 shrink-0 cursor-pointer"
+                        title="Query OpenRouter AI to propose a candidate structure"
+                      >
+                        {aiLoading ? (
+                          <>
+                            <span className="animate-spin text-xs">⏳</span> Asking AI...
+                          </>
+                        ) : (
+                          <>
+                            <span>✨</span> Ask AI to Suggest a Structure
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Phase 3B: AI Generation Loading Banner */}
+              {aiLoading && (
+                <div className="bg-violet-50/80 border border-violet-200 rounded-xl p-5 flex items-center gap-3.5 animate-in fade-in">
+                  <div className="w-8 h-8 border-3 border-violet-600 border-t-transparent rounded-full animate-spin shrink-0"></div>
+                  <div>
+                    <h4 className="text-sm font-bold text-violet-950">
+                      Generating Molecular Structure with AI...
+                    </h4>
+                    <p className="text-xs text-violet-800 mt-0.5">
+                      Consulting OpenRouter to formulate a plausible chemical hypothesis and valid SMILES for <strong className="font-mono">{buildQuery}</strong>.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Phase 3B: AI Generation Error Banner */}
+              {aiError && (
+                <div className="bg-red-50/90 border border-red-300 rounded-xl p-4 flex items-start justify-between gap-3 animate-in fade-in">
+                  <div className="flex items-start gap-3">
+                    <span className="text-lg text-red-600">⚠️</span>
+                    <div>
+                      <h4 className="text-sm font-bold text-red-950">
+                        {aiError.title || "AI Structure Generation Notice"}
+                      </h4>
+                      <p className="text-xs text-red-800 mt-0.5">
+                        {aiError.message}
+                      </p>
+                      {aiError.details && (
+                        <p className="text-xs text-red-700/80 mt-1 font-mono">
+                          {aiError.details}
+                        </p>
+                      )}
+                      {aiError.proposedSmiles && (
+                        <p className="text-xs text-red-700 mt-1 font-mono">
+                          Proposed SMILES: {aiError.proposedSmiles}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAiError(null)}
+                    className="text-red-400 hover:text-red-700 text-xs p-1 cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Phase 3B: AI-Generated Candidate Review Card (Safe preview & explicit approval) */}
+              {aiCandidate && (
+                <div className="bg-white rounded-xl shadow-sm border-2 border-violet-300 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200">
+                  {/* Card Header */}
+                  <div className="bg-gradient-to-r from-violet-50 via-purple-50 to-indigo-50 px-6 py-3.5 border-b border-violet-200 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5">
+                      <span className="flex h-3 w-3 relative">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-violet-600"></span>
+                      </span>
+                      <span className="text-violet-950 font-bold text-base">
+                        AI Structure Candidate Review
+                      </span>
+                      <span className="text-2xs bg-amber-100 text-amber-900 px-2.5 py-0.5 rounded-full font-bold border border-amber-300 flex items-center gap-1">
+                        <span>⚠️</span> Unverified Hypothesis
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {aiApproved && (
+                        <span className="text-xs bg-emerald-100 text-emerald-800 px-2.5 py-0.5 rounded-full font-semibold border border-emerald-300">
+                          ✓ Loaded on Canvas
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleDiscardAiCandidate}
+                        className="text-gray-400 hover:text-gray-600 text-sm p-1 cursor-pointer"
+                        title="Discard AI candidate"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Prominent Disclaimer Banner */}
+                  <div className="bg-amber-50/70 border-b border-amber-200 px-6 py-2.5 flex items-start gap-2.5 text-xs text-amber-900">
+                    <span className="text-base text-amber-600 shrink-0">⚠️</span>
+                    <div>
+                      <p className="font-semibold">AI-Generated — Not Independently Verified</p>
+                      <p className="text-amber-800 text-2xs mt-0.5">
+                        This molecular structure was generated by OpenRouter AI. It has not been experimentally validated and should be treated as an educational hypothesis. Review the proposed SMILES and reasoning below before deciding to load into Ketcher.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-6 space-y-4">
+                    {/* Title & Query matching */}
+                    <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-3 border-b border-gray-100">
+                      <div>
+                        <span className="text-2xs uppercase tracking-wider text-gray-500 font-semibold block">Proposed Compound Name</span>
+                        <h3 className="text-lg font-bold text-gray-900 mt-0.5">
+                          {aiCandidate.proposedName}
+                        </h3>
+                        <p className="text-xs text-gray-500 mt-0.5">
+                          Suggested for requested input: <strong className="font-mono text-gray-800">{aiCandidate.input}</strong>
+                        </p>
+                      </div>
+                      {aiCandidate.pubchemVerification && (
+                        <div className="text-right">
+                          <span className="text-2xs uppercase tracking-wider text-gray-500 font-semibold block">PubChem Verification Check</span>
+                          {aiCandidate.pubchemVerification.matched ? (
+                            <span className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-2 py-0.5 inline-block font-semibold mt-0.5">
+                              Matched CID: {aiCandidate.pubchemVerification.cid} ({aiCandidate.pubchemVerification.pubchemName})
+                            </span>
+                          ) : (
+                            <span className="text-xs text-gray-600 bg-gray-100 border border-gray-200 rounded px-2 py-0.5 inline-block mt-0.5">
+                              Novel / Unindexed in PubChem
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Properties summary */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="bg-gray-50 p-2.5 rounded-lg border border-gray-200">
+                        <span className="text-2xs text-gray-500 uppercase font-semibold">Formula</span>
+                        <p className="text-base font-bold text-gray-900 mt-0.5 font-mono">
+                          {aiCandidate.molecularFormula || "—"}
+                        </p>
+                      </div>
+                      <div className="bg-gray-50 p-2.5 rounded-lg border border-gray-200">
+                        <span className="text-2xs text-gray-500 uppercase font-semibold">Mol Weight</span>
+                        <p className="text-base font-bold text-gray-900 mt-0.5 font-mono">
+                          {aiCandidate.molecularWeight ? `${aiCandidate.molecularWeight} g/mol` : "—"}
+                        </p>
+                      </div>
+                      <div className="bg-gray-50 p-2.5 rounded-lg border border-gray-200">
+                        <span className="text-2xs text-gray-500 uppercase font-semibold">Atoms</span>
+                        <p className="text-base font-bold text-gray-900 mt-0.5 font-mono">
+                          {aiCandidate.atomCount}
+                        </p>
+                      </div>
+                      <div className="bg-gray-50 p-2.5 rounded-lg border border-gray-200">
+                        <span className="text-2xs text-gray-500 uppercase font-semibold">Parser Status</span>
+                        <p className="text-xs font-semibold text-emerald-700 mt-1 flex items-center gap-1">
+                          <span>✓</span> OCL Verified SMILES
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Proposed SMILES */}
+                    <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
+                      <div className="flex items-center justify-between text-xs text-gray-600 mb-1">
+                        <span className="font-semibold text-gray-700">Proposed SMILES String:</span>
+                        <button
+                          type="button"
+                          onClick={() => handleCopy(aiCandidate.smiles, "aiSmiles")}
+                          className="text-violet-600 hover:text-violet-800 text-xs cursor-pointer font-medium"
+                        >
+                          {copiedField === "aiSmiles" ? "✓ Copied" : "Copy SMILES"}
+                        </button>
+                      </div>
+                      <div className="font-mono text-xs text-gray-800 bg-white p-2 rounded border border-gray-200 break-all select-all">
+                        {aiCandidate.smiles}
+                      </div>
+                    </div>
+
+                    {/* AI Reasoning & Uncertainty Notes */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                      <div className="bg-violet-50/40 p-3 rounded-lg border border-violet-100">
+                        <span className="font-bold text-violet-950 block mb-1">💡 Reasoning Summary:</span>
+                        <p className="text-gray-700 leading-relaxed">
+                          {aiCandidate.reasoningSummary}
+                        </p>
+                      </div>
+                      <div className="bg-amber-50/40 p-3 rounded-lg border border-amber-100">
+                        <span className="font-bold text-amber-950 block mb-1">⚖️ Uncertainty & Isomerism:</span>
+                        <p className="text-gray-700 leading-relaxed">
+                          {aiCandidate.uncertaintyNote}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Explicit Approval Actions */}
+                    <div className="pt-3 border-t border-gray-100 flex flex-wrap items-center justify-between gap-3">
+                      <div className="text-xs text-gray-500">
+                        Review the candidate structure above. Click approve to load it onto the Ketcher drawing canvas.
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleDiscardAiCandidate}
+                          className="px-3.5 py-2 text-xs font-semibold text-gray-700 bg-white hover:bg-gray-50 rounded-lg border border-gray-300 transition-colors cursor-pointer"
+                        >
+                          Discard
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleApproveAndLoadAiCandidate}
+                          disabled={!isEditorReady}
+                          className="px-4 py-2 text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 active:bg-violet-800 rounded-lg shadow-sm transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          <span>✓</span> {aiApproved ? "Reload Approved Structure" : "Approve & Load into Canvas"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Candidate Results */}
+              {buildResult && buildResult.candidates && buildResult.candidates.length > 0 && (
+                <div className="space-y-4 pt-1 border-t border-gray-100">
+                  {/* Results Header */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-bold text-gray-900">
+                        Candidate Structures
+                      </span>
+                      <span className="text-xs font-semibold px-2 py-0.5 bg-sky-100 text-sky-800 rounded-full border border-sky-200">
+                        {buildResult.candidates.length} candidate{buildResult.candidates.length > 1 ? "s" : ""}
+                      </span>
+                      <span className="text-xs text-gray-500">
+                        for query <strong className="font-mono text-gray-800">"{buildResult.query}"</strong> ({buildResult.queryType})
+                      </span>
+                    </div>
+                    {buildResult.source === "cache" && (
+                      <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded">
+                        ⚡ cached
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Formula Isomer Honesty Notice (Requirement 9) */}
+                  {buildResult.queryType === "formula" && (
+                    <div className="bg-blue-50/70 border border-blue-200 rounded-lg p-3 text-xs text-blue-900 flex items-start gap-2">
+                      <span className="text-blue-500 font-bold shrink-0">ℹ️</span>
+                      <div>
+                        <p className="font-semibold">Molecular Formula Notice:</p>
+                        <p className="text-blue-800 mt-0.5">
+                          Molecular formulas like <strong>{buildResult.query}</strong> can correspond to multiple distinct chemical isomers. CHEMAI displays verified structural candidates from PubChem without assuming a single identity. Review candidates below and select the specific structure to load.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Candidate Cards Grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {buildResult.candidates.map((cand) => {
+                      const isSelected = selectedCandidateCid === cand.cid;
+                      return (
+                        <div
+                          key={cand.cid}
+                          className={`rounded-lg border p-4 flex flex-col justify-between transition-all ${
+                            isSelected
+                              ? "border-sky-500 bg-sky-50/40 ring-1 ring-sky-400 shadow-xs"
+                              : "border-gray-200 bg-white hover:border-gray-300 hover:shadow-2xs"
+                          }`}
+                        >
+                          <div>
+                            {/* Title & Badge */}
+                            <div className="flex items-start justify-between gap-2">
+                              <h5
+                                className="font-bold text-sm text-gray-900 line-clamp-1"
+                                title={cand.name}
+                              >
+                                {cand.name}
+                              </h5>
+                              <a
+                                href={`https://pubchem.ncbi.nlm.nih.gov/compound/${cand.cid}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-2xs text-sky-700 hover:text-sky-900 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200 shrink-0 font-medium"
+                                title="View CID on PubChem"
+                              >
+                                CID {cand.cid} ↗
+                              </a>
+                            </div>
+
+                            {/* IUPAC Name if different */}
+                            {cand.iupacName && cand.iupacName !== cand.name && (
+                              <p
+                                className="text-2xs text-gray-500 line-clamp-1 mt-0.5"
+                                title={cand.iupacName}
+                              >
+                                {cand.iupacName}
+                              </p>
+                            )}
+
+                            {/* Properties Row */}
+                            <div className="flex items-center gap-3 text-xs text-gray-600 mt-2.5 pt-2 border-t border-gray-100">
+                              <div>
+                                <span className="text-gray-400 text-2xs block uppercase font-medium">
+                                  Formula
+                                </span>
+                                <span className="font-mono font-semibold text-gray-800">
+                                  {cand.molecularFormula || "—"}
+                                </span>
+                              </div>
+                              <div>
+                                <span className="text-gray-400 text-2xs block uppercase font-medium">
+                                  MW
+                                </span>
+                                <span className="font-mono text-gray-800">
+                                  {cand.molecularWeight
+                                    ? `${cand.molecularWeight} g/mol`
+                                    : "—"}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* SMILES */}
+                            <div className="mt-2.5 bg-gray-50 rounded p-1.5 border border-gray-100 flex items-center justify-between text-2xs">
+                              <span
+                                className="font-mono text-gray-700 truncate max-w-[200px]"
+                                title={cand.smiles}
+                              >
+                                {cand.smiles}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleCopy(cand.smiles, `smiles_${cand.cid}`)
+                                }
+                                className="text-sky-600 hover:text-sky-800 ml-1 shrink-0 cursor-pointer"
+                              >
+                                {copiedField === `smiles_${cand.cid}`
+                                  ? "✓"
+                                  : "Copy"}
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Load Button */}
+                          <div className="mt-3 pt-2">
+                            <button
+                              type="button"
+                              onClick={() => handleLoadCandidateToEditor(cand)}
+                              disabled={!isEditorReady}
+                              className={`w-full py-1.5 px-3 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                                isSelected
+                                  ? "bg-sky-600 hover:bg-sky-700 text-white shadow-2xs"
+                                  : "bg-gray-100 hover:bg-sky-100 hover:text-sky-800 text-gray-800 border border-gray-200"
+                              }`}
+                            >
+                              <span>⬇</span>{" "}
+                              {isSelected
+                                ? "Reload into Canvas"
+                                : "Load into Canvas"}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Ketcher Molecular Structure Editor Canvas */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex flex-col relative">
+        <div id="ketcher-canvas-card" className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex flex-col relative">
           {/* Ketcher Canvas Header Bar */}
           <div className="bg-gray-100/80 px-4 py-2 border-b border-gray-200 flex items-center justify-between text-xs text-gray-600">
             <div className="flex items-center gap-2">

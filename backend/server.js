@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
+import OCL from "openchemlib";
 
 dotenv.config();
 
@@ -92,9 +93,18 @@ function sanitizeErrorMessage(msg) {
 }
 
 /**
- * Send explanation request to OpenRouter API with automatic fallbacks
+ * Send request to OpenRouter API with automatic fallbacks and flexible schema
  */
-async function callOpenRouter({ apiKey, model, systemInstruction, prompt, timeoutMs }) {
+async function callOpenRouter({
+  apiKey,
+  model,
+  systemInstruction,
+  schemaInstruction,
+  prompt,
+  timeoutMs,
+  maxTokens = 3000,
+  temperature = 0.1,
+}) {
   const modelsToAttempt = [model];
   if (model !== "liquid/lfm-2.5-2.6b:free") {
     modelsToAttempt.push("liquid/lfm-2.5-2.6b:free");
@@ -104,6 +114,9 @@ async function callOpenRouter({ apiKey, model, systemInstruction, prompt, timeou
   }
 
   let lastError = null;
+  const defaultSchema =
+    "You must return a valid JSON object matching the requested schema with keys: whatItIs, formulaAndStructure, functionalGroups, bondingAndCharacteristics, whyItMatters, uncertaintyAndVerificationNote.";
+  const finalSchema = schemaInstruction || defaultSchema;
 
   for (const candidateModel of modelsToAttempt) {
     try {
@@ -114,7 +127,7 @@ async function callOpenRouter({ apiKey, model, systemInstruction, prompt, timeou
           messages: [
             {
               role: "system",
-              content: `${systemInstruction}\n\nYou must return a valid JSON object matching the requested schema with keys: whatItIs, formulaAndStructure, functionalGroups, bondingAndCharacteristics, whyItMatters, uncertaintyAndVerificationNote.`,
+              content: `${systemInstruction}\n\n${finalSchema}`,
             },
             {
               role: "user",
@@ -122,8 +135,8 @@ async function callOpenRouter({ apiKey, model, systemInstruction, prompt, timeou
             },
           ],
           response_format: { type: "json_object" },
-          temperature: 0.2,
-          max_tokens: 3000,
+          temperature,
+          max_tokens: maxTokens,
         },
         {
           headers: {
@@ -217,6 +230,48 @@ async function writeExplainCache(cid, model, payload) {
     await fs.writeFile(file, JSON.stringify(payload, null, 2), "utf8");
   } catch (cacheErr) {
     console.warn("[cache] explain cache write error:", cacheErr?.message);
+  }
+}
+
+async function readLookupCache(type, query) {
+  try {
+    const safe = `lookup_${type}_${query.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+    const file = path.join(CACHE_DIR, `${safe}.json`);
+    const raw = await fs.readFile(file, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeLookupCache(type, query, payload) {
+  try {
+    const safe = `lookup_${type}_${query.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+    const file = path.join(CACHE_DIR, `${safe}.json`);
+    await fs.writeFile(file, JSON.stringify(payload, null, 2), "utf8");
+  } catch (cacheErr) {
+    console.warn("[cache] lookup cache write error:", cacheErr?.message);
+  }
+}
+
+async function readGenerationCache(query) {
+  try {
+    const safe = `gen_${query.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+    const file = path.join(CACHE_DIR, `${safe}.json`);
+    const raw = await fs.readFile(file, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeGenerationCache(query, payload) {
+  try {
+    const safe = `gen_${query.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+    const file = path.join(CACHE_DIR, `${safe}.json`);
+    await fs.writeFile(file, JSON.stringify(payload, null, 2), "utf8");
+  } catch (cacheErr) {
+    console.warn("[cache] generation cache write error:", cacheErr?.message);
   }
 }
 
@@ -544,6 +599,652 @@ app.post("/api/identify", async (req, res) => {
   }
 
   return res.json(outcome.data);
+});
+
+/**
+ * Reverse structure lookup by chemical formula using PubChem fastformula endpoint.
+ * Returns up to 12 candidates sharing the formula.
+ */
+async function lookupByFormula(formula) {
+  try {
+    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastformula/${encodeURIComponent(
+      formula
+    )}/property/Title,IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES,IsomericSMILES/JSON?MaxRecords=12`;
+
+    const resp = await axios.get(url, { timeout: AXIOS_TIMEOUT });
+    const properties = resp.data?.PropertyTable?.Properties || [];
+
+    if (!properties.length) {
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: `No compounds found matching formula "${formula}" in PubChem.`,
+          code: "NOT_FOUND",
+          query: formula,
+          queryType: "formula",
+        },
+      };
+    }
+
+    const candidates = properties
+      .map((p) => {
+        const smiles = p.CanonicalSMILES || p.IsomericSMILES || p.SMILES || "";
+        return {
+          cid: p.CID,
+          name: p.Title || p.IUPACName || `Compound CID ${p.CID}`,
+          iupacName: p.IUPACName || null,
+          molecularFormula: p.MolecularFormula || formula,
+          molecularWeight: p.MolecularWeight ? String(p.MolecularWeight) : null,
+          smiles,
+        };
+      })
+      .filter((c) => Boolean(c.smiles));
+
+    if (!candidates.length) {
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: `No compounds with usable structural representations found for formula "${formula}".`,
+          code: "NOT_FOUND",
+          query: formula,
+          queryType: "formula",
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        source: "pubchem",
+        query: formula,
+        queryType: "formula",
+        count: candidates.length,
+        candidates,
+      },
+    };
+  } catch (err) {
+    if (err.response?.status === 404) {
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: `No compounds found matching formula "${formula}" in PubChem.`,
+          code: "NOT_FOUND",
+          query: formula,
+          queryType: "formula",
+        },
+      };
+    }
+
+    if (err.response?.status === 500 || err.response?.status === 400) {
+      return {
+        ok: false,
+        status: 400,
+        body: {
+          error: `Invalid chemical formula format: "${formula}".`,
+          details: "Please check your formula syntax (e.g., C2H6O, C6H6, H2O, NaCl).",
+          code: "INVALID_FORMULA",
+          query: formula,
+          queryType: "formula",
+        },
+      };
+    }
+
+    if (err.code === "ETIMEDOUT" || err.code === "ECONNABORTED") {
+      return {
+        ok: false,
+        status: 504,
+        body: {
+          error: "PubChem service request timed out while searching formula. Please try again.",
+          code: "PUBCHEM_TIMEOUT",
+        },
+      };
+    }
+
+    if (err.response?.status === 503 || err.response?.status === 429) {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          error: "PubChem service is temporarily busy (rate limited). Please try again shortly.",
+          code: "PUBCHEM_RATE_LIMIT",
+        },
+      };
+    }
+
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        error: "Failed to search formula in PubChem.",
+        details: sanitizeErrorMessage(err?.message),
+        code: "PUBCHEM_ERROR",
+      },
+    };
+  }
+}
+
+/**
+ * Reverse structure lookup by chemical compound name using PubChem name and CID properties.
+ */
+async function lookupByName(name) {
+  try {
+    const cidUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(
+      name
+    )}/cids/JSON`;
+
+    const cidResp = await axios.get(cidUrl, { timeout: AXIOS_TIMEOUT });
+    const cids = cidResp.data?.IdentifierList?.CID || [];
+
+    if (!cids.length || cids[0] === 0) {
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: `No compounds found matching name "${name}" in PubChem.`,
+          code: "NOT_FOUND",
+          query: name,
+          queryType: "name",
+        },
+      };
+    }
+
+    const targetCids = cids.slice(0, 10);
+    const propsUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${targetCids.join(
+      ","
+    )}/property/Title,IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES,IsomericSMILES/JSON`;
+
+    const propsResp = await axios.get(propsUrl, { timeout: AXIOS_TIMEOUT });
+    const properties = propsResp.data?.PropertyTable?.Properties || [];
+
+    const candidates = properties
+      .map((p) => {
+        const smiles = p.CanonicalSMILES || p.IsomericSMILES || p.SMILES || "";
+        return {
+          cid: p.CID,
+          name: p.Title || p.IUPACName || name,
+          iupacName: p.IUPACName || null,
+          molecularFormula: p.MolecularFormula || null,
+          molecularWeight: p.MolecularWeight ? String(p.MolecularWeight) : null,
+          smiles,
+        };
+      })
+      .filter((c) => Boolean(c.smiles));
+
+    if (!candidates.length) {
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: `No compounds with usable structural representations found for name "${name}".`,
+          code: "NOT_FOUND",
+          query: name,
+          queryType: "name",
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        source: "pubchem",
+        query: name,
+        queryType: "name",
+        count: candidates.length,
+        candidates,
+      },
+    };
+  } catch (err) {
+    if (err.response?.status === 404) {
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: `No compounds found matching name "${name}" in PubChem.`,
+          code: "NOT_FOUND",
+          query: name,
+          queryType: "name",
+        },
+      };
+    }
+
+    if (err.code === "ETIMEDOUT" || err.code === "ECONNABORTED") {
+      return {
+        ok: false,
+        status: 504,
+        body: {
+          error: "PubChem service request timed out while searching compound name. Please try again.",
+          code: "PUBCHEM_TIMEOUT",
+        },
+      };
+    }
+
+    if (err.response?.status === 503 || err.response?.status === 429) {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          error: "PubChem service is temporarily busy (rate limited). Please try again shortly.",
+          code: "PUBCHEM_RATE_LIMIT",
+        },
+      };
+    }
+
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        error: "Failed to search compound name in PubChem.",
+        details: sanitizeErrorMessage(err?.message),
+        code: "PUBCHEM_ERROR",
+      },
+    };
+  }
+}
+
+/**
+ * Phase 3A: Reverse Structure Lookup Endpoint
+ * Supports search by compound name or molecular formula.
+ */
+app.post("/api/lookup-structure", async (req, res) => {
+  const { query, type = "auto" } = req.body || {};
+
+  if (!query || typeof query !== "string" || !query.trim()) {
+    return res.status(400).json({
+      error: "Please provide a compound name or molecular formula.",
+      code: "EMPTY_QUERY",
+    });
+  }
+
+  const trimmedQuery = query.trim();
+  console.log(`[/api/lookup-structure] query="${trimmedQuery}", type="${type}"`);
+
+  // Detect whether query looks like a molecular formula
+  // Basic Hill system / chemical formula pattern: e.g. C2H6O, H2O, C6H6, NaCl, CH4
+  const formulaRegex = /^(?:[A-Z][a-z]?\d*)+$/;
+  const isLikelyFormula = formulaRegex.test(trimmedQuery);
+
+  let searchType = type;
+  if (searchType === "auto") {
+    searchType = isLikelyFormula ? "formula" : "name";
+  }
+
+  try {
+    // 1. Check lookup cache
+    const cached = await readLookupCache(searchType, trimmedQuery);
+    if (cached) {
+      console.log(`[/api/lookup-structure] served from cache for ${searchType}: ${trimmedQuery}`);
+      return res.json({ source: "cache", ...cached });
+    }
+
+    if (searchType === "formula") {
+      const result = await lookupByFormula(trimmedQuery);
+      if (result.ok) {
+        await writeLookupCache("formula", trimmedQuery, result.data);
+        return res.json(result.data);
+      }
+
+      // If auto-detect tried formula but got 404, fallback to name
+      if (type === "auto" && result.status === 404) {
+        console.log(`[/api/lookup-structure] formula lookup returned 404 for "${trimmedQuery}", trying name fallback...`);
+        const nameFallback = await lookupByName(trimmedQuery);
+        if (nameFallback.ok) {
+          await writeLookupCache("name", trimmedQuery, nameFallback.data);
+          return res.json(nameFallback.data);
+        }
+      }
+
+      return res.status(result.status).json(result.body);
+    } else {
+      // Name lookup
+      const result = await lookupByName(trimmedQuery);
+      if (result.ok) {
+        await writeLookupCache("name", trimmedQuery, result.data);
+        return res.json(result.data);
+      }
+
+      // If auto-detect tried name but got 404 and pattern looks like formula, fallback to formula
+      if (type === "auto" && result.status === 404 && isLikelyFormula) {
+        console.log(`[/api/lookup-structure] name lookup returned 404 for "${trimmedQuery}", trying formula fallback...`);
+        const formulaFallback = await lookupByFormula(trimmedQuery);
+        if (formulaFallback.ok) {
+          await writeLookupCache("formula", trimmedQuery, formulaFallback.data);
+          return res.json(formulaFallback.data);
+        }
+      }
+
+      return res.status(result.status).json(result.body);
+    }
+  } catch (err) {
+    console.error("[/api/lookup-structure] unexpected error:", err);
+    return res.status(500).json({
+      error: "Unexpected server error during structure lookup.",
+      details: sanitizeErrorMessage(err?.message),
+    });
+  }
+});
+
+const GENERATION_SYSTEM_INSTRUCTION = `You are the CHEMAI Chemical Structure Assistant.
+Your task is to propose ONE plausible, chemically valid molecular structure representation (SMILES) for a given compound name or molecular formula that could not be found in PubChem.
+
+STRICT ACCURACY & HONESTY GUIDELINES:
+1. Provide a single representative chemical candidate for the user's input.
+2. Return a syntactically valid SMILES string that can be parsed into a molecular graph.
+3. If the input is a molecular formula, remember that many constitutional and stereoisomers exist. Propose ONE representative isomer, and clearly state in reasoningSummary and uncertaintyNote that this is one of several possible isomers.
+4. CRITICAL: Do NOT invent PubChem CIDs, fictional CAS registry numbers, fake citations, experimental laboratory data, or claims of official verification.
+5. Do NOT claim the structure is verified or unique unless proven. State clearly that this is an AI-generated structural hypothesis.
+6. Keep reasoningSummary under 35 words. Keep uncertaintyNote under 30 words.
+7. Return ONLY a valid JSON object matching the requested schema. No Markdown codeblocks, no text before or after.`;
+
+const GENERATION_SCHEMA_INSTRUCTION = `You must return a valid JSON object with EXACTLY the following keys:
+- "input": string (the exact requested user input)
+- "proposedName": string (the common or IUPAC chemical name of the proposed structure)
+- "smiles": string (a syntactically valid SMILES string)
+- "molecularFormula": string (the proposed molecular formula, e.g. C7H15NO2)
+- "reasoningSummary": string (concise explanation of why this structure matches the input)
+- "uncertaintyNote": string (explicit note regarding isomerism, tautomers, or unverified hypothesis status)`;
+
+const GENERATION_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    input: { type: Type.STRING },
+    proposedName: { type: Type.STRING },
+    smiles: { type: Type.STRING },
+    molecularFormula: { type: Type.STRING },
+    reasoningSummary: { type: Type.STRING },
+    uncertaintyNote: { type: Type.STRING },
+  },
+  required: [
+    "input",
+    "proposedName",
+    "smiles",
+    "reasoningSummary",
+    "uncertaintyNote",
+  ],
+};
+
+/**
+ * Phase 3B: AI-Assisted Structure Generation Endpoint
+ * Generates a plausible chemical structure hypothesis using OpenRouter (or Gemini fallback)
+ * when PubChem does not index the compound.
+ */
+app.post("/api/generate-structure", async (req, res) => {
+  const { query } = req.body || {};
+
+  if (!query || typeof query !== "string" || !query.trim()) {
+    return res.status(400).json({
+      error: "Please provide a chemical name or molecular formula to generate a structure.",
+      code: "EMPTY_QUERY",
+    });
+  }
+
+  const trimmedQuery = query.trim();
+  if (trimmedQuery.length > 150) {
+    return res.status(400).json({
+      error: "Query exceeds maximum permitted length of 150 characters.",
+      code: "QUERY_TOO_LONG",
+    });
+  }
+
+  console.log(`[/api/generate-structure] request for query="${trimmedQuery}"`);
+
+  // 1. Check AI configuration securely
+  const aiConfig = getAIConfig();
+  if (!aiConfig.isConfigured) {
+    console.warn(`[/api/generate-structure] ${aiConfig.provider} API key is not configured.`);
+    return res.status(503).json({
+      error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} API key is not configured on the backend server.`,
+      details: `Add a valid ${aiConfig.provider === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY"} to backend/.env and restart the backend server.`,
+      code: "AI_CONFIG_MISSING",
+      configError: true,
+    });
+  }
+
+  // 2. Check cache
+  const cached = await readGenerationCache(trimmedQuery);
+  if (cached && cached.candidate) {
+    console.log(`[/api/generate-structure] served from cache for "${trimmedQuery}"`);
+    return res.json({ source: `${aiConfig.provider}-cache`, ...cached });
+  }
+
+  // 3. Build prompt
+  const prompt = `Propose a single plausible molecular structure representation for the chemical name or formula: "${trimmedQuery}".
+Return ONLY the requested JSON object containing input, proposedName, smiles, molecularFormula, reasoningSummary, uncertaintyNote.`;
+
+  try {
+    let rawText = "";
+    let usedModel = aiConfig.activeModel;
+
+    if (aiConfig.provider === "openrouter") {
+      const openRouterResult = await callOpenRouter({
+        apiKey: aiConfig.activeKey,
+        model: aiConfig.activeModel,
+        systemInstruction: GENERATION_SYSTEM_INSTRUCTION,
+        schemaInstruction: GENERATION_SCHEMA_INSTRUCTION,
+        prompt,
+        timeoutMs: GEMINI_TIMEOUT,
+        maxTokens: 2500,
+        temperature: 0.1,
+      });
+      rawText = openRouterResult.text;
+      usedModel = openRouterResult.model;
+    } else {
+      const ai = new GoogleGenAI({ apiKey: aiConfig.activeKey });
+
+      let timeoutHandle;
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const err = new Error("Gemini API request timed out");
+          err.code = "ETIMEDOUT";
+          reject(err);
+        }, GEMINI_TIMEOUT);
+      });
+
+      const generationPromise = ai.models.generateContent({
+        model: aiConfig.activeModel,
+        contents: prompt,
+        config: {
+          systemInstruction: GENERATION_SYSTEM_INSTRUCTION,
+          temperature: 0.2,
+          maxOutputTokens: 1024,
+          responseMimeType: "application/json",
+          responseSchema: GENERATION_RESPONSE_SCHEMA,
+        },
+      });
+
+      const response = await Promise.race([generationPromise, timeoutPromise]);
+      clearTimeout(timeoutHandle);
+      rawText = response?.text ? response.text.trim() : "";
+    }
+
+    if (!rawText) {
+      return res.status(502).json({
+        error: "AI service returned an empty response. Please try again.",
+        code: "EMPTY_MODEL_RESPONSE",
+      });
+    }
+
+    // 4. Parse JSON safely
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      const cleanedJson = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+      try {
+        parsed = JSON.parse(cleanedJson);
+      } catch {
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            parsed = JSON.parse(jsonMatch[0]);
+          } catch {
+            parsed = null;
+          }
+        }
+      }
+    }
+
+    if (!parsed || !parsed.smiles || typeof parsed.smiles !== "string" || !parsed.smiles.trim()) {
+      console.warn("[/api/generate-structure] malformed output:", rawText.slice(0, 300));
+      return res.status(502).json({
+        error: "AI model did not return a parseable JSON response with a structure SMILES.",
+        details: "The model output could not be parsed into the required schema.",
+        code: "AI_MALFORMED_RESPONSE",
+      });
+    }
+
+    const proposedSmiles = parsed.smiles.trim();
+
+    // 5. Validate SMILES using OpenChemLib on backend
+    let atomCount = 0;
+    let calculatedFormula = null;
+    let calculatedMw = null;
+    let canonicalSmiles = proposedSmiles;
+
+    try {
+      const mol = OCL.Molecule.fromSmiles(proposedSmiles);
+      atomCount = mol.getAllAtoms();
+      if (atomCount === 0) {
+        throw new Error("Molecule contains 0 atoms.");
+      }
+      const mf = mol.getMolecularFormula();
+      calculatedFormula = mf.formula;
+      calculatedMw = mf.absoluteWeight ? mf.absoluteWeight.toFixed(2) : null;
+      canonicalSmiles = mol.toSmiles() || proposedSmiles;
+    } catch (oclErr) {
+      console.warn("[/api/generate-structure] OpenChemLib parse error on generated SMILES:", oclErr?.message);
+      return res.status(422).json({
+        error: "AI proposed an unparseable molecular structure (invalid SMILES syntax).",
+        details: sanitizeErrorMessage(oclErr?.message || "Invalid SMILES"),
+        code: "AI_INVALID_SMILES",
+        proposedSmiles,
+        proposedName: parsed.proposedName || trimmedQuery,
+      });
+    }
+
+    // 6. Optional PubChem check for extra context
+    let pubchemVerification = {
+      checked: true,
+      matched: false,
+      note: "Hypothesis not independently verified in PubChem",
+    };
+    try {
+      const checkOutcome = await identifyStructureWithPubChem({
+        smiles: canonicalSmiles,
+        preferCache: true,
+      });
+      if (checkOutcome.ok && checkOutcome.data?.cid) {
+        pubchemVerification = {
+          checked: true,
+          matched: true,
+          cid: checkOutcome.data.cid,
+          pubchemName: checkOutcome.data.name,
+          note: `Matched existing PubChem entry: ${checkOutcome.data.name} (CID ${checkOutcome.data.cid})`,
+        };
+      }
+    } catch (checkErr) {
+      console.log("[/api/generate-structure] optional PubChem verification check skipped/failed:", checkErr?.message);
+    }
+
+    const payload = {
+      source: aiConfig.provider,
+      model: usedModel,
+      isAiGenerated: true,
+      verified: Boolean(pubchemVerification.matched),
+      candidate: {
+        input: trimmedQuery,
+        proposedName: parsed.proposedName || trimmedQuery,
+        smiles: canonicalSmiles,
+        originalSmiles: proposedSmiles,
+        molecularFormula: calculatedFormula || parsed.molecularFormula || null,
+        molecularWeight: calculatedMw,
+        atomCount,
+        reasoningSummary: parsed.reasoningSummary || "AI-generated molecular structure hypothesis.",
+        uncertaintyNote:
+          parsed.uncertaintyNote ||
+          "This structure is an unverified hypothesis and may represent one of multiple constitutional isomers.",
+        pubchemVerification,
+      },
+      disclaimer:
+        "AI-generated molecular hypothesis — not independently verified. Verify against chemical literature before use.",
+      generatedAt: new Date().toISOString(),
+    };
+
+    await writeGenerationCache(trimmedQuery, payload);
+
+    return res.json(payload);
+  } catch (err) {
+    const errorData = err?.response?.data?.error;
+    const rawErrorMsg = typeof errorData === "string" ? errorData : errorData?.message || err?.message;
+    const safeMsg = sanitizeErrorMessage(rawErrorMsg);
+    const status = err?.status || err?.response?.status;
+
+    console.error(`[/api/generate-structure] ${aiConfig.provider} error:`, {
+      status,
+      code: err?.code,
+      message: safeMsg,
+    });
+
+    if (err?.code === "ETIMEDOUT" || err?.name === "AbortError" || err?.code === "ECONNABORTED") {
+      return res.status(504).json({
+        error: `The ${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} structure generation request timed out. Please try again.`,
+        code: "AI_TIMEOUT",
+      });
+    }
+
+    if (
+      status === 402 ||
+      safeMsg.toLowerCase().includes("prepayment") ||
+      safeMsg.toLowerCase().includes("credits") ||
+      safeMsg.toLowerCase().includes("balance")
+    ) {
+      return res.status(402).json({
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} credits or balance depleted.`,
+        details: safeMsg,
+        code: "AI_CREDITS_DEPLETED",
+        configError: true,
+      });
+    }
+
+    if (
+      status === 429 ||
+      safeMsg.toLowerCase().includes("quota") ||
+      safeMsg.toLowerCase().includes("rate limit") ||
+      safeMsg.toLowerCase().includes("resource_exhausted")
+    ) {
+      return res.status(429).json({
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} rate limit reached. Please wait a moment before requesting another generation.`,
+        details: safeMsg,
+        code: "AI_RATE_LIMIT",
+      });
+    }
+
+    if (
+      status === 400 ||
+      status === 401 ||
+      status === 403 ||
+      safeMsg.toLowerCase().includes("api_key_invalid") ||
+      safeMsg.toLowerCase().includes("api key not valid") ||
+      safeMsg.toLowerCase().includes("unauthorized")
+    ) {
+      return res.status(503).json({
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} authentication or configuration error.`,
+        details: `Please verify that your ${aiConfig.provider === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY"} in backend/.env is valid and active. (${safeMsg})`,
+        code: "AI_AUTH_ERROR",
+        configError: true,
+      });
+    }
+
+    return res.status(502).json({
+      error: `Unable to generate structure with ${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} at this time.`,
+      details: safeMsg,
+      code: "AI_UPSTREAM_ERROR",
+    });
+  }
 });
 
 const EXPLANATION_SYSTEM_INSTRUCTION = `You are the CHEMAI Educational Chemistry Assistant.
