@@ -297,17 +297,19 @@ export default function MolecularEditor() {
       if (!res.ok) {
         if (
           data.configError ||
+          data.code === "AI_CONFIG_MISSING" ||
           data.code === "GEMINI_CONFIG_MISSING" ||
+          data.code === "AI_AUTH_ERROR" ||
           data.code === "GEMINI_AUTH_ERROR"
         ) {
           setExplainError({
             type: "config_error",
-            title: "Gemini Configuration Required",
+            title: "AI Configuration Required",
             message:
-              data.error || "Gemini API key is not configured on the backend server.",
+              data.error || "AI API key is not configured on the backend server.",
             details:
               data.details ||
-              "Set GEMINI_API_KEY in backend/.env (see backend/.env.example) and restart the backend server.",
+              "Set OPENROUTER_API_KEY in backend/.env (see backend/.env.example) and restart the backend server.",
             code: data.code,
           });
         } else if (res.status === 404 || data.code === "UNIDENTIFIED_COMPOUND") {
@@ -319,21 +321,30 @@ export default function MolecularEditor() {
               "This phase supports chemistry explanations for identified PubChem compounds only.",
             details: data.details,
           });
-        } else if (res.status === 429 || data.code === "GEMINI_RATE_LIMIT") {
+        } else if (res.status === 402 || data.code === "AI_CREDITS_DEPLETED") {
+          setExplainError({
+            type: "config_error",
+            title: "AI Credits Depleted",
+            message:
+              data.error || "Your AI provider credits or quota are depleted.",
+            details: data.details,
+          });
+        } else if (res.status === 429 || data.code === "AI_RATE_LIMIT" || data.code === "GEMINI_RATE_LIMIT") {
           setExplainError({
             type: "rate_limit",
-            title: "Gemini Rate Limit Reached",
+            title: "AI Rate Limit Reached",
             message:
               data.error ||
-              "Gemini API rate limit or quota reached. Please wait a moment and try again.",
+              "AI rate limit reached. Please wait a moment and try again.",
+            details: data.details,
           });
-        } else if (res.status === 504 || data.code === "GEMINI_TIMEOUT") {
+        } else if (res.status === 504 || data.code === "AI_TIMEOUT" || data.code === "GEMINI_TIMEOUT") {
           setExplainError({
             type: "timeout",
             title: "Explanation Request Timed Out",
             message:
               data.error ||
-              "The Gemini explanation request timed out. Please try again shortly.",
+              "The AI explanation request timed out. Please try again shortly.",
           });
         } else {
           setExplainError({
@@ -341,7 +352,7 @@ export default function MolecularEditor() {
             title: "Explanation Service Error",
             message:
               data.error ||
-              "Unable to generate chemistry explanation from the Gemini service.",
+              "Unable to generate chemistry explanation at this time.",
             details: data.details,
           });
         }
@@ -697,7 +708,7 @@ export default function MolecularEditor() {
                   onClick={handleExplainStructure}
                   disabled={!identifyResult?.cid || explainLoading}
                   className="px-3.5 py-1.5 text-xs sm:text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 active:bg-violet-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
-                  title="Generate a beginner-friendly chemistry explanation using Gemini AI"
+                  title="Generate an educational chemistry explanation using AI"
                 >
                   {explainLoading ? (
                     <>
@@ -827,7 +838,7 @@ export default function MolecularEditor() {
                   <div className="w-8 h-8 border-3 border-violet-600 border-t-transparent rounded-full animate-spin shrink-0"></div>
                   <div>
                     <h4 className="text-sm font-bold text-violet-950">
-                      Generating Gemini Chemistry Explanation...
+                      Generating AI Chemistry Explanation...
                     </h4>
                     <p className="text-xs text-violet-700 mt-0.5">
                       Analyzing verified PubChem structure ({identifyResult.name}, {identifyResult.molecularFormula}) for functional groups, bonding, and educational insights.
@@ -836,7 +847,7 @@ export default function MolecularEditor() {
                 </div>
               )}
 
-              {/* Phase 2: Gemini Explanation Error / Configuration Notice */}
+              {/* Phase 2: AI Explanation Error / Configuration Notice */}
               {explainError && (
                 <div
                   className={`mt-4 rounded-xl p-5 border flex items-start justify-between gap-4 ${
@@ -879,7 +890,7 @@ export default function MolecularEditor() {
                 </div>
               )}
 
-              {/* Phase 2: Gemini Chemistry Explanation Panel */}
+              {/* Phase 2: AI Chemistry Explanation Panel */}
               {explainResult && explainResult.explanation && (
                 <div className="mt-4 bg-gradient-to-br from-violet-50/60 via-white to-indigo-50/40 rounded-xl border-2 border-violet-200 overflow-hidden shadow-xs">
                   {/* Panel Header */}
@@ -887,10 +898,10 @@ export default function MolecularEditor() {
                     <div className="flex items-center gap-2">
                       <ChemAINeuralHexIcon className="w-5 h-5 text-violet-700" />
                       <h3 className="text-sm font-bold text-violet-950">
-                        Gemini Chemistry Explanation Assistant
+                        {explainResult.source?.startsWith("openrouter") ? "OpenRouter Chemistry Assistant" : "AI Chemistry Explanation Assistant"}
                       </h3>
                       <span className="text-xs bg-violet-200/80 text-violet-900 px-2 py-0.5 rounded-full font-mono font-medium">
-                        {explainResult.model || "gemini-2.5-flash"}
+                        {explainResult.model || "openrouter/free"}
                       </span>
                     </div>
                     <div className="flex items-center gap-2">

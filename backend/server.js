@@ -16,31 +16,59 @@ const AXIOS_TIMEOUT = 10000; // ms
 const GEMINI_TIMEOUT = 25000; // ms
 const CACHE_DIR = path.resolve("./cache/pubchem_json");
 
-const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
 
 /**
- * Safely read Gemini configuration from environment variables.
- * Never logs or exposes the API key.
+ * Safely read AI configuration (OpenRouter or Gemini) from environment variables.
+ * Never logs or exposes API keys.
  */
-function getGeminiConfig() {
-  const rawKey = process.env.GEMINI_API_KEY;
-  const apiKey = typeof rawKey === "string" ? rawKey.trim() : "";
-  const isPlaceholder =
-    !apiKey ||
-    apiKey === "your_gemini_api_key_here" ||
-    apiKey === "YOUR_GEMINI_API_KEY" ||
-    apiKey.toLowerCase().startsWith("your_");
+function getAIConfig() {
+  const openRouterKey = typeof process.env.OPENROUTER_API_KEY === "string" ? process.env.OPENROUTER_API_KEY.trim() : "";
+  const isOpenRouterConfigured =
+    Boolean(openRouterKey) &&
+    !openRouterKey.startsWith("your_") &&
+    openRouterKey !== "YOUR_OPENROUTER_API_KEY";
 
-  const rawModel = process.env.GEMINI_MODEL;
-  const model =
-    typeof rawModel === "string" && rawModel.trim()
-      ? rawModel.trim()
-      : DEFAULT_GEMINI_MODEL;
+  const geminiKey = typeof process.env.GEMINI_API_KEY === "string" ? process.env.GEMINI_API_KEY.trim() : "";
+  const isGeminiConfigured =
+    Boolean(geminiKey) &&
+    !geminiKey.startsWith("your_") &&
+    geminiKey !== "YOUR_GEMINI_API_KEY";
+
+  const requestedProvider = (process.env.AI_PROVIDER || "").toLowerCase().trim();
+  let provider = "openrouter";
+  if (requestedProvider === "gemini") {
+    provider = "gemini";
+  } else if (requestedProvider === "openrouter") {
+    provider = "openrouter";
+  } else {
+    // Auto-detect: if openrouter is configured prefer it, else gemini
+    provider = isOpenRouterConfigured ? "openrouter" : "gemini";
+  }
+
+  const openRouterModel = process.env.OPENROUTER_MODEL?.trim() || DEFAULT_OPENROUTER_MODEL;
+  const geminiModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+
+  const isConfigured = provider === "openrouter" ? isOpenRouterConfigured : isGeminiConfigured;
+  const activeModel = provider === "openrouter" ? openRouterModel : geminiModel;
+  const activeKey = provider === "openrouter" ? (isOpenRouterConfigured ? openRouterKey : null) : (isGeminiConfigured ? geminiKey : null);
 
   return {
-    isConfigured: !isPlaceholder,
-    apiKey: isPlaceholder ? null : apiKey,
-    model,
+    provider,
+    isConfigured,
+    activeModel,
+    activeKey,
+    openRouter: {
+      isConfigured: isOpenRouterConfigured,
+      apiKey: isOpenRouterConfigured ? openRouterKey : null,
+      model: openRouterModel,
+    },
+    gemini: {
+      isConfigured: isGeminiConfigured,
+      apiKey: isGeminiConfigured ? geminiKey : null,
+      model: geminiModel,
+    },
   };
 }
 
@@ -50,12 +78,89 @@ function getGeminiConfig() {
 function sanitizeErrorMessage(msg) {
   if (!msg || typeof msg !== "string") return "Unknown service error";
   let cleaned = msg;
-  const rawKey = process.env.GEMINI_API_KEY;
-  if (rawKey && typeof rawKey === "string" && rawKey.trim().length > 4) {
-    cleaned = cleaned.split(rawKey.trim()).join("[REDACTED]");
+  const rawGemini = process.env.GEMINI_API_KEY;
+  if (rawGemini && typeof rawGemini === "string" && rawGemini.trim().length > 4) {
+    cleaned = cleaned.split(rawGemini.trim()).join("[REDACTED]");
+  }
+  const rawOpenRouter = process.env.OPENROUTER_API_KEY;
+  if (rawOpenRouter && typeof rawOpenRouter === "string" && rawOpenRouter.trim().length > 4) {
+    cleaned = cleaned.split(rawOpenRouter.trim()).join("[REDACTED]");
   }
   cleaned = cleaned.replace(/AIza[0-9A-Za-z\-_]{20,}/g, "[REDACTED_KEY]");
+  cleaned = cleaned.replace(/sk-or-v1-[0-9a-zA-Z]{20,}/g, "[REDACTED_KEY]");
   return cleaned;
+}
+
+/**
+ * Send explanation request to OpenRouter API with automatic fallbacks
+ */
+async function callOpenRouter({ apiKey, model, systemInstruction, prompt, timeoutMs }) {
+  const modelsToAttempt = [model];
+  if (model !== "liquid/lfm-2.5-2.6b:free") {
+    modelsToAttempt.push("liquid/lfm-2.5-2.6b:free");
+  }
+  if (!modelsToAttempt.includes("openrouter/free")) {
+    modelsToAttempt.push("openrouter/free");
+  }
+
+  let lastError = null;
+
+  for (const candidateModel of modelsToAttempt) {
+    try {
+      const response = await axios.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+          model: candidateModel,
+          messages: [
+            {
+              role: "system",
+              content: `${systemInstruction}\n\nYou must return a valid JSON object matching the requested schema with keys: whatItIs, formulaAndStructure, functionalGroups, bondingAndCharacteristics, whyItMatters, uncertaintyAndVerificationNote.`,
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          response_format: { type: "json_object" },
+          temperature: 0.2,
+          max_tokens: 3000,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5173",
+            "X-Title": "ChemAI",
+          },
+          timeout: timeoutMs,
+        }
+      );
+
+      const choice = response.data?.choices?.[0];
+      let rawText = choice?.message?.content?.trim() || "";
+
+      // Fallback: If a reasoning model put the JSON draft inside its reasoning field
+      if (!rawText && choice?.message?.reasoning) {
+        const match = choice.message.reasoning.match(/\{[\s\S]*\}/);
+        if (match) {
+          rawText = match[0].trim();
+        }
+      }
+
+      if (rawText) {
+        return {
+          text: rawText,
+          model: response.data?.model || candidateModel,
+        };
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`[callOpenRouter] candidate model ${candidateModel} failed:`, err?.response?.data || err?.message);
+    }
+  }
+
+  if (lastError) throw lastError;
+  return { text: "", model };
 }
 
 app.get("/api/test", (req, res) => {
@@ -548,29 +653,30 @@ app.post("/api/explain-structure", async (req, res) => {
     synonyms: (compound.synonyms || []).slice(0, 6),
   };
 
-  // 3. Check Gemini API Key configuration securely
-  const geminiConfig = getGeminiConfig();
-  if (!geminiConfig.isConfigured) {
-    console.warn("[/api/explain-structure] GEMINI_API_KEY is not configured.");
+  // 3. Check AI configuration securely
+  const aiConfig = getAIConfig();
+  if (!aiConfig.isConfigured) {
+    console.warn(`[/api/explain-structure] ${aiConfig.provider} API key is not configured.`);
     return res.status(503).json({
-      error: "Gemini API key is not configured on the backend server.",
+      error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} API key is not configured on the backend server.`,
       details:
-        "Add a valid GEMINI_API_KEY to backend/.env (see backend/.env.example) and restart the backend server to enable AI chemistry explanations.",
-      code: "GEMINI_CONFIG_MISSING",
+        `Add a valid ${aiConfig.provider === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY"} to backend/.env (see backend/.env.example) and restart the backend server.`,
+      code: "AI_CONFIG_MISSING",
       configError: true,
       referenceData,
     });
   }
 
-  // 4. Check explanation cache to avoid unnecessary repeated Gemini calls
-  const cachedExplanation = await readExplainCache(compound.cid, geminiConfig.model);
+  // 4. Check explanation cache
+  const cacheKey = `${aiConfig.provider}_${aiConfig.activeModel}`;
+  const cachedExplanation = await readExplainCache(compound.cid, cacheKey);
   if (cachedExplanation && cachedExplanation.explanation) {
     console.log(
-      `[/api/explain-structure] served cached explanation for CID ${compound.cid} (${compound.name})`
+      `[/api/explain-structure] served cached explanation for CID ${compound.cid} (${compound.name}) via ${aiConfig.provider}`
     );
     return res.json({
       ...cachedExplanation,
-      source: "gemini-cache",
+      source: `${aiConfig.provider}-cache`,
       referenceData,
     });
   }
@@ -581,7 +687,7 @@ app.post("/api/explain-structure", async (req, res) => {
 VERIFIED PUBCHEM REFERENCE DATA (Server-Derived):
 - Preferred Name: ${referenceData.name}
 - PubChem CID: ${referenceData.cid}
-- IUPAC Name: ${referenceData.iupacName || "Not listed"}
+- IUPAC Name: ${referenceData.iupACName || referenceData.iupacName || "Not listed"}
 - Molecular Formula: ${referenceData.molecularFormula || "Not listed"}
 - Molecular Weight: ${referenceData.molecularWeight ? `${referenceData.molecularWeight} g/mol` : "Not listed"}
 - Canonical SMILES: ${referenceData.canonicalSmiles}
@@ -597,42 +703,58 @@ Provide a concise, accurate educational explanation covering:
 6. A note distinguishing the verified PubChem facts above from AI chemical interpretation and noting any uncertainties (uncertaintyAndVerificationNote).`;
 
   try {
-    const ai = new GoogleGenAI({ apiKey: geminiConfig.apiKey });
+    let rawText = "";
+    let usedModel = aiConfig.activeModel;
 
-    let timeoutHandle;
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutHandle = setTimeout(() => {
-        const err = new Error("Gemini API request timed out");
-        err.code = "ETIMEDOUT";
-        reject(err);
-      }, GEMINI_TIMEOUT);
-    });
-
-    const generationPromise = ai.models.generateContent({
-      model: geminiConfig.model,
-      contents: prompt,
-      config: {
+    if (aiConfig.provider === "openrouter") {
+      const openRouterResult = await callOpenRouter({
+        apiKey: aiConfig.activeKey,
+        model: aiConfig.activeModel,
         systemInstruction: EXPLANATION_SYSTEM_INSTRUCTION,
-        temperature: 0.2,
-        maxOutputTokens: 1024,
-        responseMimeType: "application/json",
-        responseSchema: EXPLANATION_RESPONSE_SCHEMA,
-      },
-    });
+        prompt,
+        timeoutMs: GEMINI_TIMEOUT,
+      });
+      rawText = openRouterResult.text;
+      usedModel = openRouterResult.model;
+    } else {
+      const ai = new GoogleGenAI({ apiKey: aiConfig.activeKey });
 
-    const response = await Promise.race([generationPromise, timeoutPromise]);
-    clearTimeout(timeoutHandle);
+      let timeoutHandle;
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const err = new Error("Gemini API request timed out");
+          err.code = "ETIMEDOUT";
+          reject(err);
+        }, GEMINI_TIMEOUT);
+      });
 
-    const rawText = response?.text ? response.text.trim() : "";
+      const generationPromise = ai.models.generateContent({
+        model: aiConfig.activeModel,
+        contents: prompt,
+        config: {
+          systemInstruction: EXPLANATION_SYSTEM_INSTRUCTION,
+          temperature: 0.2,
+          maxOutputTokens: 1024,
+          responseMimeType: "application/json",
+          responseSchema: EXPLANATION_RESPONSE_SCHEMA,
+        },
+      });
+
+      const response = await Promise.race([generationPromise, timeoutPromise]);
+      clearTimeout(timeoutHandle);
+
+      rawText = response?.text ? response.text.trim() : "";
+    }
+
     if (!rawText) {
       return res.status(502).json({
-        error: "Gemini returned an empty explanation response. Please try again.",
+        error: "AI service returned an empty explanation response. Please try again.",
         code: "EMPTY_MODEL_RESPONSE",
         referenceData,
       });
     }
 
-    let parsedExplanation;
+    let parsedExplanation = null;
     try {
       parsedExplanation = JSON.parse(rawText);
     } catch {
@@ -641,21 +763,32 @@ Provide a concise, accurate educational explanation covering:
       try {
         parsedExplanation = JSON.parse(cleanedJson);
       } catch {
-        parsedExplanation = {
-          whatItIs: rawText,
-          formulaAndStructure: `Molecular formula: ${referenceData.molecularFormula || "N/A"} (SMILES: ${referenceData.canonicalSmiles}).`,
-          functionalGroups: "See overview above.",
-          bondingAndCharacteristics: "See overview above.",
-          whyItMatters: "See overview above.",
-          uncertaintyAndVerificationNote:
-            "AI-generated interpretation. Verify structural details against PubChem and standard chemistry references.",
-        };
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            parsedExplanation = JSON.parse(jsonMatch[0]);
+          } catch {
+            parsedExplanation = null;
+          }
+        }
       }
     }
 
+    if (!parsedExplanation) {
+      parsedExplanation = {
+        whatItIs: rawText,
+        formulaAndStructure: `Molecular formula: ${referenceData.molecularFormula || "N/A"} (SMILES: ${referenceData.canonicalSmiles}).`,
+        functionalGroups: "See overview above.",
+        bondingAndCharacteristics: "See overview above.",
+        whyItMatters: "See overview above.",
+        uncertaintyAndVerificationNote:
+          "AI-generated interpretation. Verify structural details against PubChem and standard chemistry references.",
+      };
+    }
+
     const payload = {
-      source: "gemini",
-      model: geminiConfig.model,
+      source: aiConfig.provider,
+      model: usedModel,
       referenceData,
       explanation: {
         whatItIs: parsedExplanation.whatItIs || "",
@@ -667,35 +800,71 @@ Provide a concise, accurate educational explanation covering:
           parsedExplanation.uncertaintyAndVerificationNote ||
           "AI-generated chemical interpretations are for educational guidance and should be verified independently.",
       },
-      disclaimer:
-        "Reference data (Compound Name, CID, IUPAC Name, Formula, Molecular Weight, and Canonical SMILES) is retrieved directly from PubChem. The structural walk-through and functional group explanations are generated by Gemini AI and may require independent verification.",
+      disclaimer: `Reference data (Compound Name, CID, IUPAC Name, Formula, Molecular Weight, and Canonical SMILES) is retrieved directly from PubChem. The structural walk-through and functional group explanations are generated by ${aiConfig.provider === "openrouter" ? "OpenRouter AI" : "Gemini AI"} and may require independent verification.`,
       generatedAt: new Date().toISOString(),
     };
 
-    await writeExplainCache(compound.cid, geminiConfig.model, payload);
+    await writeExplainCache(compound.cid, cacheKey, payload);
 
     return res.json(payload);
   } catch (err) {
-    const safeMsg = sanitizeErrorMessage(err?.message);
+    const errorData = err?.response?.data?.error;
+    const rawErrorMsg = typeof errorData === "string" ? errorData : errorData?.message || err?.message;
+    const safeMsg = sanitizeErrorMessage(rawErrorMsg);
     const status = err?.status || err?.response?.status;
-    console.error("[/api/explain-structure] Gemini error:", {
+    console.error(`[/api/explain-structure] ${aiConfig.provider} error:`, {
       status,
       code: err?.code,
       message: safeMsg,
     });
 
-    if (err?.code === "ETIMEDOUT" || err?.name === "AbortError") {
+    if (err?.code === "ETIMEDOUT" || err?.name === "AbortError" || err?.code === "ECONNABORTED") {
       return res.status(504).json({
-        error: "The Gemini explanation request timed out. Please try again shortly.",
-        code: "GEMINI_TIMEOUT",
+        error: `The ${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} explanation request timed out. Please try again shortly.`,
+        code: "AI_TIMEOUT",
         referenceData,
       });
     }
 
-    if (status === 429 || safeMsg.toLowerCase().includes("quota") || safeMsg.toLowerCase().includes("rate limit")) {
+    if (
+      status === 402 ||
+      safeMsg.toLowerCase().includes("prepayment") ||
+      safeMsg.toLowerCase().includes("credits") ||
+      safeMsg.toLowerCase().includes("balance")
+    ) {
+      return res.status(402).json({
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} credits or balance depleted.`,
+        details: safeMsg,
+        code: "AI_CREDITS_DEPLETED",
+        configError: true,
+        referenceData,
+      });
+    }
+
+    if (
+      status === 429 ||
+      safeMsg.toLowerCase().includes("quota") ||
+      safeMsg.toLowerCase().includes("rate limit") ||
+      safeMsg.toLowerCase().includes("resource_exhausted")
+    ) {
       return res.status(429).json({
-        error: "Gemini API rate limit or quota reached. Please wait a moment before requesting another explanation.",
-        code: "GEMINI_RATE_LIMIT",
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} rate limit reached. Please wait a moment before requesting another explanation.`,
+        details: safeMsg,
+        code: "AI_RATE_LIMIT",
+        referenceData,
+      });
+    }
+
+    if (
+      status === 404 ||
+      safeMsg.toLowerCase().includes("not_found") ||
+      safeMsg.toLowerCase().includes("no longer available")
+    ) {
+      return res.status(503).json({
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} model is unavailable or not found.`,
+        details: safeMsg,
+        code: "AI_MODEL_UNAVAILABLE",
+        configError: true,
         referenceData,
       });
     }
@@ -705,22 +874,22 @@ Provide a concise, accurate educational explanation covering:
       status === 401 ||
       status === 403 ||
       safeMsg.toLowerCase().includes("api_key_invalid") ||
-      safeMsg.toLowerCase().includes("api key not valid")
+      safeMsg.toLowerCase().includes("api key not valid") ||
+      safeMsg.toLowerCase().includes("unauthorized")
     ) {
       return res.status(503).json({
-        error: "Gemini API configuration or authentication error.",
-        details:
-          "Please verify that GEMINI_API_KEY and GEMINI_MODEL in backend/.env are valid and active.",
-        code: "GEMINI_AUTH_ERROR",
+        error: `${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} authentication or configuration error.`,
+        details: `Please verify that your ${aiConfig.provider === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY"} in backend/.env is valid and active. (${safeMsg})`,
+        code: "AI_AUTH_ERROR",
         configError: true,
         referenceData,
       });
     }
 
     return res.status(502).json({
-      error: "Unable to generate chemistry explanation from Gemini at this time.",
+      error: `Unable to generate chemistry explanation from ${aiConfig.provider === "openrouter" ? "OpenRouter" : "Gemini"} at this time.`,
       details: safeMsg,
-      code: "GEMINI_UPSTREAM_ERROR",
+      code: "AI_UPSTREAM_ERROR",
       referenceData,
     });
   }
