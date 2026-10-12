@@ -1081,6 +1081,14 @@ export default function MolecularEditor() {
                 <span className="text-xs bg-indigo-100 text-indigo-800 px-2.5 py-0.5 rounded-full font-semibold border border-indigo-200">
                   CID: {identifyResult.cid}
                 </span>
+                {identifyResult.casNumber && (
+                  <span
+                    className="text-xs bg-slate-100 text-slate-800 px-2.5 py-0.5 rounded-full font-semibold border border-slate-300"
+                    title="Chemical Abstracts Service (CAS) Registry Number"
+                  >
+                    CAS: {identifyResult.casNumber}
+                  </span>
+                )}
                 {identifyResult.ambiguous && (
                   <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-medium border border-amber-200">
                     Ambiguous Match ({identifyResult.matchCount} records)
@@ -1198,6 +1206,54 @@ export default function MolecularEditor() {
                 />
               </div>
 
+              {/* Real-World Encyclopedic Context (Wikipedia API) */}
+              {identifyResult.wikipedia && (
+                <div className="bg-gradient-to-br from-slate-50 to-blue-50/40 rounded-xl p-4 sm:p-5 border border-slate-200/90 shadow-2xs">
+                  <div className="flex items-start justify-between gap-3 mb-2.5">
+                    <div className="flex items-center gap-2">
+                      <span className="w-5 h-5 rounded-full bg-slate-800 text-white flex items-center justify-center font-serif font-black text-xs select-none">
+                        W
+                      </span>
+                      <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                        Real-World Context & Applications (Wikipedia)
+                      </h4>
+                    </div>
+                    {identifyResult.wikipedia.url && (
+                      <a
+                        href={identifyResult.wikipedia.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-1"
+                      >
+                        <span>Read on Wikipedia</span>
+                        <span>↗</span>
+                      </a>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row gap-4 items-start">
+                    {identifyResult.wikipedia.thumbnail && (
+                      <img
+                        src={identifyResult.wikipedia.thumbnail}
+                        alt={identifyResult.wikipedia.title || identifyResult.name}
+                        className="w-20 h-20 object-contain rounded-lg bg-white p-1 border border-slate-200 shrink-0 shadow-2xs"
+                        loading="lazy"
+                      />
+                    )}
+                    <div className="flex-1 min-w-0">
+                      {identifyResult.wikipedia.description && (
+                        <p className="text-xs font-semibold text-slate-600 mb-1 capitalize">
+                          {identifyResult.wikipedia.description}
+                        </p>
+                      )}
+                      <p className="text-xs sm:text-sm text-slate-700 leading-relaxed">
+                        {identifyResult.wikipedia.extract}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Synonyms / Alternative Names */}
               {identifyResult.synonyms && identifyResult.synonyms.length > 0 && (
                 <div>
@@ -1312,13 +1368,19 @@ export default function MolecularEditor() {
                       <span className="font-semibold">{explainResult.referenceData?.name || identifyResult.name}</span>
                       {" · "}
                       <span className="font-mono">CID {explainResult.referenceData?.cid || identifyResult.cid}</span>
+                      {(explainResult.referenceData?.casNumber || identifyResult.casNumber) && (
+                        <>
+                          {" · "}
+                          <span className="font-mono">CAS {explainResult.referenceData?.casNumber || identifyResult.casNumber}</span>
+                        </>
+                      )}
                       {" · "}
                       <span className="font-mono">{explainResult.referenceData?.molecularFormula || identifyResult.molecularFormula}</span>
                       {" · "}
                       <span className="font-mono">{explainResult.referenceData?.molecularWeight || identifyResult.molecularWeight} g/mol</span>
                     </div>
                     <span className="text-[11px] text-indigo-700 font-medium">
-                      Source: PubChem PUG REST
+                      Source: PubChem PUG REST{(explainResult.referenceData?.wikipedia || identifyResult?.wikipedia) ? " & Wikipedia" : ""}
                     </span>
                   </div>
 

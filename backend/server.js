@@ -275,6 +275,102 @@ async function writeGenerationCache(query, payload) {
   }
 }
 
+async function readWikiCache(name) {
+  try {
+    const safe = `wiki_${name.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+    const file = path.join(CACHE_DIR, `${safe}.json`);
+    const raw = await fs.readFile(file, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeWikiCache(name, payload) {
+  try {
+    const safe = `wiki_${name.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+    const file = path.join(CACHE_DIR, `${safe}.json`);
+    await fs.writeFile(file, JSON.stringify(payload, null, 2), "utf8");
+  } catch (err) {
+    console.warn("[cache] wiki cache write error:", err?.message);
+  }
+}
+
+/**
+ * Live external knowledge retrieval from Wikipedia REST API.
+ * Retrieves encyclopedic summary, real-world context, description, and thumbnail image.
+ */
+async function fetchWikipediaSummary(name, synonyms = []) {
+  if (!name || typeof name !== "string") return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  const cached = await readWikiCache(trimmed);
+  if (cached) return cached;
+
+  const candidates = [trimmed, ...synonyms].filter(Boolean).slice(0, 5);
+
+  // 1. Direct page summary attempt
+  for (const candidate of candidates) {
+    try {
+      const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(candidate)}`;
+      const resp = await axios.get(url, {
+        headers: { "User-Agent": "ChemAI/1.0 (educational chemistry app; contact@chemai.local)" },
+        timeout: 4000,
+      });
+      if (resp.data && (resp.data.type === "standard" || resp.data.extract)) {
+        const payload = {
+          title: resp.data.title,
+          description: resp.data.description || null,
+          extract: resp.data.extract,
+          url:
+            resp.data.content_urls?.desktop?.page ||
+            `https://en.wikipedia.org/wiki/${encodeURIComponent(resp.data.title)}`,
+          thumbnail: resp.data.thumbnail?.source || null,
+        };
+        await writeWikiCache(trimmed, payload);
+        return payload;
+      }
+    } catch {}
+  }
+
+  // 2. Fallback: Search Wikipedia for "<name> chemical compound"
+  try {
+    const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+      trimmed + " chemical compound"
+    )}&format=json`;
+    const sResp = await axios.get(searchUrl, {
+      headers: { "User-Agent": "ChemAI/1.0 (educational chemistry app)" },
+      timeout: 4000,
+    });
+    const firstHit = sResp.data?.query?.search?.[0];
+    if (firstHit?.title) {
+      const pageUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(firstHit.title)}`;
+      const pResp = await axios.get(pageUrl, {
+        headers: { "User-Agent": "ChemAI/1.0 (educational chemistry app)" },
+        timeout: 4000,
+      });
+      if (pResp.data?.extract) {
+        const payload = {
+          title: pResp.data.title,
+          description: pResp.data.description || null,
+          extract: pResp.data.extract,
+          url:
+            pResp.data.content_urls?.desktop?.page ||
+            `https://en.wikipedia.org/wiki/${encodeURIComponent(pResp.data.title)}`,
+          thumbnail: pResp.data.thumbnail?.source || null,
+        };
+        await writeWikiCache(trimmed, payload);
+        return payload;
+      }
+    }
+  } catch (err) {
+    console.warn("[wikipedia] search fallback error:", err?.message);
+  }
+
+  return null;
+}
+
 /**
  * Shared helper to validate SMILES/Molfile and identify the compound via PubChem PUG REST.
  * Used by both POST /api/identify and POST /api/explain-structure.
@@ -415,6 +511,18 @@ async function identifyStructureWithPubChem({ smiles, molfile, preferCache = fal
       props.IUPACName ||
       `Compound CID ${cid}`;
 
+    // Extract CAS Registry Number if present in synonyms
+    const casPattern = /^\d{2,7}-\d{2}-\d$/;
+    const casNumber = synonyms.find((s) => casPattern.test(s)) || null;
+
+    // Retrieve real-world Wikipedia context
+    let wikipedia = null;
+    try {
+      wikipedia = await fetchWikipediaSummary(preferredName, synonyms);
+    } catch (wikiErr) {
+      console.warn("[/api/identify] wikipedia fetch notice:", wikiErr?.message);
+    }
+
     const result = {
       source: "pubchem",
       cid,
@@ -425,6 +533,8 @@ async function identifyStructureWithPubChem({ smiles, molfile, preferCache = fal
       canonicalSmiles: props.CanonicalSMILES || props.IsomericSMILES || trimmedSmiles,
       inputSmiles: trimmedSmiles,
       synonyms: synonyms.slice(0, 8),
+      casNumber,
+      wikipedia,
       ambiguous: isAmbiguous,
       matchCount: cids.length,
       allCids,
@@ -599,6 +709,33 @@ app.post("/api/identify", async (req, res) => {
   }
 
   return res.json(outcome.data);
+});
+
+/**
+ * Real-time external encyclopedic knowledge endpoint (Wikipedia API).
+ * Returns verified real-world context, commercial applications, description, and Wikipedia article link.
+ */
+app.get("/api/compound-knowledge", async (req, res) => {
+  const { name } = req.query || {};
+  if (!name || typeof name !== "string" || !name.trim()) {
+    return res.status(400).json({ error: "Please provide a compound name query.", code: "EMPTY_QUERY" });
+  }
+
+  const queryName = name.trim();
+  try {
+    const wikiData = await fetchWikipediaSummary(queryName);
+    return res.json({
+      compound: queryName,
+      wikipedia: wikiData,
+      source: "wikipedia",
+    });
+  } catch (err) {
+    console.error("[/api/compound-knowledge] error:", err?.message);
+    return res.status(500).json({
+      error: "Failed to fetch compound knowledge from Wikipedia.",
+      details: sanitizeErrorMessage(err?.message),
+    });
+  }
 });
 
 /**
@@ -1352,6 +1489,8 @@ app.post("/api/explain-structure", async (req, res) => {
     canonicalSmiles: compound.canonicalSmiles,
     inputSmiles: compound.inputSmiles,
     synonyms: (compound.synonyms || []).slice(0, 6),
+    casNumber: compound.casNumber || null,
+    wikipedia: compound.wikipedia || null,
   };
 
   // 3. Check AI configuration securely
@@ -1382,26 +1521,31 @@ app.post("/api/explain-structure", async (req, res) => {
     });
   }
 
-  // 5. Build prompt using strictly server-derived PubChem reference properties
+  // 5. Build prompt using strictly server-derived PubChem reference properties and verified Wikipedia knowledge
+  const casLine = referenceData.casNumber ? `\n- CAS Registry Number: ${referenceData.casNumber}` : "";
+  const wikiLine = referenceData.wikipedia?.extract
+    ? `\n- Real-World Knowledge & Uses (Wikipedia): ${referenceData.wikipedia.extract.slice(0, 350)}`
+    : "";
+
   const prompt = `Explain the following verified chemical compound for a chemistry student:
 
-VERIFIED PUBCHEM REFERENCE DATA (Server-Derived):
+VERIFIED PUBCHEM & ENCYCLOPEDIC REFERENCE DATA (Server-Derived):
 - Preferred Name: ${referenceData.name}
-- PubChem CID: ${referenceData.cid}
+- PubChem CID: ${referenceData.cid}${casLine}
 - IUPAC Name: ${referenceData.iupACName || referenceData.iupacName || "Not listed"}
 - Molecular Formula: ${referenceData.molecularFormula || "Not listed"}
 - Molecular Weight: ${referenceData.molecularWeight ? `${referenceData.molecularWeight} g/mol` : "Not listed"}
 - Canonical SMILES: ${referenceData.canonicalSmiles}
 - Submitted SMILES: ${referenceData.inputSmiles}
-- Common Synonyms: ${referenceData.synonyms.length > 0 ? referenceData.synonyms.join(", ") : "None listed"}
+- Common Synonyms: ${referenceData.synonyms.length > 0 ? referenceData.synonyms.join(", ") : "None listed"}${wikiLine}
 
 Provide a concise, accurate educational explanation covering:
 1. What the compound is (whatItIs).
 2. Its molecular formula and basic structural features (formulaAndStructure).
 3. Functional groups present in this structure and their roles — do not invent groups that are absent (functionalGroups).
 4. Relevant bonding or structural characteristics such as rings, conjugation, aromaticity, or bond types (bondingAndCharacteristics).
-5. A beginner-friendly explanation of why these structural features matter (whyItMatters).
-6. A note distinguishing the verified PubChem facts above from AI chemical interpretation and noting any uncertainties (uncertaintyAndVerificationNote).`;
+5. A beginner-friendly explanation of why these structural features matter, including real-world applications (whyItMatters).
+6. A note distinguishing the verified PubChem & encyclopedic facts above from AI chemical interpretation and noting any uncertainties (uncertaintyAndVerificationNote).`;
 
   try {
     let rawText = "";
