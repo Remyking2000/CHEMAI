@@ -980,9 +980,9 @@ export default function MolecularEditor() {
 
   if (activeView === "mobile") {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col overflow-x-hidden text-slate-100">
-        {/* Mobile-optimized workspace container */}
-        <div className="flex-1 flex flex-col h-[100dvh] max-h-[100dvh] relative">
+      <div className="min-h-screen bg-slate-900 flex flex-col overflow-hidden text-slate-100">
+        {/* Mobile-optimized workspace container fitting screen perfectly */}
+        <div className="flex-1 flex flex-col h-[calc(100dvh-64px)] max-h-[calc(100dvh-64px)] sm:h-[100dvh] sm:max-h-[100dvh] relative overflow-hidden">
           <MobileMolecularEditor
             initialMol={mobileMol}
             initialSmiles={mobileInitialSmiles}

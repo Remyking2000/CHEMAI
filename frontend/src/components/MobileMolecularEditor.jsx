@@ -61,7 +61,12 @@ export default function MobileMolecularEditor({
         console.warn("Could not parse initialSmiles for mobile editor:", e);
       }
     }
-    return EMPTY_MOL;
+    // Default starter structure (Benzene) ensures canvas is immediately visible with a clear structure
+    try {
+      return placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true);
+    } catch {
+      return EMPTY_MOL;
+    }
   });
 
   const molRef = useRef(mol);
@@ -846,10 +851,18 @@ export default function MobileMolecularEditor({
       {/* ------------------------------------------------------------------ */}
       {/* 2. Molecular Drawing Canvas (SVG with Exact Matrix Mapping)        */}
       {/* ------------------------------------------------------------------ */}
-      <div ref={canvasContainerRef} className="flex-1 relative w-full h-full bg-slate-50 overflow-hidden cursor-crosshair">
+      <div
+        ref={canvasContainerRef}
+        className="flex-1 min-h-[360px] w-full relative bg-slate-100/70 overflow-hidden cursor-crosshair border-y border-slate-200"
+        style={{ minHeight: "360px", flex: "1 1 auto" }}
+      >
         <svg
           ref={svgRef}
+          viewBox={`0 0 ${dimensions.width || 360} ${dimensions.height || 480}`}
+          width="100%"
+          height="100%"
           className="w-full h-full block touch-none"
+          style={{ width: "100%", height: "100%", minHeight: "360px", display: "block" }}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
@@ -857,12 +870,13 @@ export default function MobileMolecularEditor({
           role="region"
           aria-label="Molecular drawing canvas"
         >
-          {/* Subtle Grid Dots */}
+          {/* High-Contrast, Clearly Visible Dot Grid */}
           <defs>
-            <pattern id="dot-grid" width="28" height="28" patternUnits="userSpaceOnUse">
-              <circle cx="14" cy="14" r="1.1" fill="#cbd5e1" />
+            <pattern id="dot-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+              <circle cx="16" cy="16" r="1.6" fill="#94a3b8" opacity="0.65" />
             </pattern>
           </defs>
+          <rect width="100%" height="100%" fill="#f8fafc" />
           <rect width="100%" height="100%" fill="url(#dot-grid)" />
 
           {/* Molecule Container (Centered + Pan + Zoom) */}
