@@ -7,7 +7,7 @@ import OCL from "openchemlib";
 import "ketcher-react/dist/index.css";
 import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
 import MobileMolecularEditor from "../components/MobileMolecularEditor";
-import { exportStructure } from "../lib/mobileMolecule";
+import { exportStructure, molFromSmiles, EMPTY_MOL } from "../lib/mobileMolecule";
 import { API_ROUTES } from "../config/api";
 
 // Ensure KetcherLogger has a safe fallback before Ketcher finishes async initialization
@@ -133,13 +133,23 @@ export default function MolecularEditor() {
     };
   }, []);
 
-  // Bidirectional layout view switchers preserving molecular state
+  // Bidirectional layout view switchers preserving molecular state (including empty structures)
   const handleSwitchToMobile = async () => {
     try {
       if (ketcher) {
         const { smiles } = await getCurrentStructure();
         if (smiles && smiles.trim()) {
-          setMobileInitialSmiles(smiles.trim());
+          const s = smiles.trim();
+          setMobileInitialSmiles(s);
+          try {
+            setMobileMol(molFromSmiles(s));
+          } catch (e) {
+            console.warn("Could not sync Ketcher structure to mobileMol:", e);
+          }
+        } else {
+          // Empty Ketcher structure clears mobile editor
+          setMobileInitialSmiles("");
+          setMobileMol(EMPTY_MOL);
         }
       }
     } catch (e) {
@@ -156,6 +166,15 @@ export default function MolecularEditor() {
         if (exported && exported.smiles) {
           if (ketcher && typeof ketcher.setMolecule === "function") {
             await ketcher.setMolecule(exported.smiles);
+          }
+        }
+      } else {
+        // Clearing mobile clears corresponding desktop Ketcher structure
+        if (ketcher && typeof ketcher.setMolecule === "function") {
+          try {
+            await ketcher.setMolecule("");
+          } catch {
+            await ketcher.setMolecule("\n \n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END");
           }
         }
       }

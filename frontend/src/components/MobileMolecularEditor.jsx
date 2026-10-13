@@ -7,6 +7,7 @@ import {
   ALL_ELEMENTS,
   ELEMENT_COLORS,
   getAtom,
+  getBond,
   findAtomNear,
   findBondNear,
   addAtom,
@@ -111,9 +112,12 @@ export default function MobileMolecularEditor({
     });
   }, [mol, onStructureChange]);
 
-  // Synchronize when initialSmiles changes externally
+  // Synchronize when initialSmiles or initialMol changes externally
   useEffect(() => {
-    if (initialSmiles && typeof initialSmiles === "string") {
+    if (initialSmiles === "") {
+      setMol(EMPTY_MOL);
+      setHistory({ past: [], future: [] });
+    } else if (initialSmiles && typeof initialSmiles === "string" && initialSmiles.trim()) {
       try {
         const loaded = molFromSmiles(initialSmiles.trim());
         setMol(loaded);
@@ -123,6 +127,12 @@ export default function MobileMolecularEditor({
       }
     }
   }, [initialSmiles]);
+
+  useEffect(() => {
+    if (initialMol) {
+      setMol(initialMol);
+    }
+  }, [initialMol]);
 
   // ---------------------------------------------------------------------------
   // Tool Selection & Configuration
@@ -163,15 +173,16 @@ export default function MobileMolecularEditor({
   // ---------------------------------------------------------------------------
   // Canvas Viewport & ResizeObserver (100% Exact Screen-to-World Sync)
   // ---------------------------------------------------------------------------
-  const containerRef = useRef(null);
+  const canvasContainerRef = useRef(null);
   const svgRef = useRef(null);
+  const worldGroupRef = useRef(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
   const [dimensions, setDimensions] = useState({ width: 360, height: 480 });
 
-  // Update container size in real time via ResizeObserver
+  // Measure the actual SVG drawing viewport, not the combined editor container
   useEffect(() => {
-    const el = containerRef.current;
+    const el = canvasContainerRef.current;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -185,10 +196,38 @@ export default function MobileMolecularEditor({
     return () => observer.disconnect();
   }, []);
 
-  // Map screen (clientX, clientY) -> Molecule World Coordinates
+  // Map screen (clientX, clientY) -> Molecule World Coordinates using SVG Matrix Transform
   const screenToWorld = useCallback(
     (clientX, clientY) => {
       if (!svgRef.current) return { x: 0, y: 0 };
+
+      // Priority 1: Exact SVG transformation matrix inversion
+      if (worldGroupRef.current && typeof worldGroupRef.current.getScreenCTM === "function") {
+        try {
+          const ctm = worldGroupRef.current.getScreenCTM();
+          if (ctm) {
+            const inv = ctm.inverse();
+            if (typeof DOMPoint !== "undefined") {
+              const pt = new DOMPoint(clientX, clientY).matrixTransform(inv);
+              if (Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+                return { x: pt.x, y: pt.y };
+              }
+            } else if (typeof svgRef.current.createSVGPoint === "function") {
+              const pt = svgRef.current.createSVGPoint();
+              pt.x = clientX;
+              pt.y = clientY;
+              const res = pt.matrixTransform(inv);
+              if (Number.isFinite(res.x) && Number.isFinite(res.y)) {
+                return { x: res.x, y: res.y };
+              }
+            }
+          }
+        } catch {
+          // Fall through to bounding rect calculation if matrix cannot be inverted
+        }
+      }
+
+      // Priority 2: Viewport-relative fallback using measured SVG canvas bounds
       const rect = svgRef.current.getBoundingClientRect();
       const screenX = clientX - rect.left;
       const screenY = clientY - rect.top;
@@ -256,6 +295,7 @@ export default function MobileMolecularEditor({
     startWorldY: 0,
     movingAtomOrigX: 0,
     movingAtomOrigY: 0,
+    molBeforeDrag: null,
   });
 
   const [dragPreview, setDragPreview] = useState(null); // { from: {x,y}, to: {x,y}, targetAtomId }
@@ -280,6 +320,7 @@ export default function MobileMolecularEditor({
       g.isPinch = true;
       g.dragType = null;
       g.startAtom = null;
+      g.molBeforeDrag = null;
       setDragPreview(null);
       const pts = Array.from(g.pointers.values());
       g.initialPinchDist = Math.hypot(pts[0].clientX - pts[1].clientX, pts[0].clientY - pts[1].clientY);
@@ -293,6 +334,7 @@ export default function MobileMolecularEditor({
     // Single touch setup
     g.isPinch = false;
     g.dragStarted = false;
+    g.molBeforeDrag = null;
     g.startScreenX = e.clientX;
     g.startScreenY = e.clientY;
 
@@ -350,6 +392,7 @@ export default function MobileMolecularEditor({
         setSelectedBondId(null);
         g.dragType = "move_atom";
         g.startAtom = hitAtom;
+        g.molBeforeDrag = molRef.current;
         g.movingAtomOrigX = hitAtom.x;
         g.movingAtomOrigY = hitAtom.y;
       } else if (hitBond) {
@@ -460,9 +503,21 @@ export default function MobileMolecularEditor({
 
     const world = screenToWorld(e.clientX, e.clientY);
 
-    // 1. Finished moving an atom
+    // 1. Finished moving an atom (commit one clean history entry)
     if (g.dragType === "move_atom" && g.startAtom && g.dragStarted) {
-      pushState(molRef.current);
+      if (g.molBeforeDrag) {
+        setHistory((h) => ({
+          past: [...h.past.slice(-25), g.molBeforeDrag],
+          future: [],
+        }));
+        if (onStructureChange) {
+          try {
+            onStructureChange(molRef.current);
+          } catch (err) {
+            console.error("onStructureChange error:", err);
+          }
+        }
+      }
       showToast("Moved atom");
     }
 
@@ -480,58 +535,69 @@ export default function MobileMolecularEditor({
       showToast(`Added ${bondOrder === 1 ? "single" : bondOrder === 2 ? "double" : "triple"} bond`);
     }
 
-    // 3. Simple Tap (No dragging)
-    else if (!g.dragStarted && !g.isPinch) {
+    // 3. Simple Tap in Move Tool (No dragging)
+    else if (activeTool === "move" && !g.dragStarted && !g.isPinch) {
+      const atomHitRadius = Math.max(BOND_LEN * 0.55, 26 / zoom);
+      const hitAtom = findAtomNear(molRef.current, world.x, world.y, atomHitRadius);
+      if (hitAtom) {
+        setSelectedAtomId(hitAtom.id);
+        setSelectedBondId(null);
+      } else {
+        setSelectedAtomId(null);
+        setSelectedBondId(null);
+      }
+    }
+
+    // 4. Simple Tap in Draw Tool (No dragging)
+    else if (activeTool === "draw" && !g.dragStarted && !g.isPinch) {
       const atomHitRadius = Math.max(BOND_LEN * 0.55, 26 / zoom);
       const hitAtom = findAtomNear(molRef.current, world.x, world.y, atomHitRadius);
 
-      if (activeTool === "draw") {
-        if (hitAtom) {
-          // A. An atom was already selected and user tapped a DIFFERENT atom:
-          // Connect them with a bond!
-          if (selectedAtomId != null && selectedAtomId !== hitAtom.id) {
-            const nextM = addBond(molRef.current, selectedAtomId, hitAtom.id, bondOrder);
-            pushState(nextM);
-            setSelectedAtomId(hitAtom.id);
-            showToast("Connected atoms");
-          }
-          // B. User tapped the ALREADY selected atom:
-          // Sprout a new substituent bond!
-          else if (selectedAtomId === hitAtom.id) {
-            const nextM = addSubstituent(molRef.current, hitAtom.id, activeElement, bondOrder);
-            pushState(nextM);
-            showToast("Added substituent");
-          }
-          // C. User tapped an unselected atom:
-          // Select it!
-          else {
-            setSelectedAtomId(hitAtom.id);
-            setSelectedBondId(null);
-          }
+      if (hitAtom) {
+        // A. An atom was already selected and user tapped a DIFFERENT atom:
+        // Connect them with a bond!
+        if (selectedAtomId != null && selectedAtomId !== hitAtom.id) {
+          const nextM = addBond(molRef.current, selectedAtomId, hitAtom.id, bondOrder);
+          pushState(nextM);
+          setSelectedAtomId(hitAtom.id);
+          showToast("Connected atoms");
+        }
+        // B. User tapped the ALREADY selected atom:
+        // Sprout a new substituent bond!
+        else if (selectedAtomId === hitAtom.id) {
+          const nextM = addSubstituent(molRef.current, hitAtom.id, activeElement, bondOrder);
+          pushState(nextM);
+          showToast("Added substituent");
+        }
+        // C. User tapped an unselected atom:
+        // Select it!
+        else {
+          setSelectedAtomId(hitAtom.id);
+          setSelectedBondId(null);
+        }
+      } else {
+        // Tapped empty canvas
+        if (selectedAtomId != null) {
+          // If an atom was selected, tap empty canvas to extend chain towards that point!
+          const nextM = drawBondTo(
+            molRef.current,
+            selectedAtomId,
+            getAtom(molRef.current, selectedAtomId),
+            world,
+            bondOrder,
+            activeElement
+          );
+          pushState(nextM);
+          // Select the newly added atom
+          const newestAtom = nextM.atoms[nextM.atoms.length - 1];
+          if (newestAtom) setSelectedAtomId(newestAtom.id);
+          showToast("Extended bond");
         } else {
-          // Tapped empty canvas
-          if (selectedAtomId != null) {
-            // If an atom was selected, tap empty canvas to extend chain towards that point!
-            const nextM = drawBondTo(
-              molRef.current,
-              selectedAtomId,
-              getAtom(molRef.current, selectedAtomId),
-              world,
-              bondOrder,
-              activeElement
-            );
-            pushState(nextM);
-            // Select the newly added atom
-            const newestAtom = nextM.atoms[nextM.atoms.length - 1];
-            if (newestAtom) setSelectedAtomId(newestAtom.id);
-            showToast("Extended bond");
-          } else {
-            // If nothing was selected, place a starter atom
-            const { mol: nextM, id } = addAtom(molRef.current, world.x, world.y, activeElement);
-            pushState(nextM);
-            setSelectedAtomId(id);
-            showToast(`Added ${activeElement} atom`);
-          }
+          // If nothing was selected, place a starter atom
+          const { mol: nextM, id } = addAtom(molRef.current, world.x, world.y, activeElement);
+          pushState(nextM);
+          setSelectedAtomId(id);
+          showToast(`Added ${activeElement} atom`);
         }
       }
     }
@@ -542,6 +608,26 @@ export default function MobileMolecularEditor({
       g.dragType = null;
       g.startAtom = null;
       g.dragStarted = false;
+      g.molBeforeDrag = null;
+    }
+  };
+
+  const handlePointerCancel = (e) => {
+    const g = gestureRef.current;
+    if (g.pointers.has(e.pointerId)) {
+      g.pointers.delete(e.pointerId);
+    }
+    // Revert atom position if an interrupted drag occurred
+    if (g.dragType === "move_atom" && g.molBeforeDrag) {
+      setMol(g.molBeforeDrag);
+    }
+    setDragPreview(null);
+    if (g.pointers.size === 0) {
+      g.isPinch = false;
+      g.dragType = null;
+      g.startAtom = null;
+      g.dragStarted = false;
+      g.molBeforeDrag = null;
     }
   };
 
@@ -665,9 +751,7 @@ export default function MobileMolecularEditor({
 
   return (
     <div
-      ref={containerRef}
       className={`flex flex-col h-full w-full bg-slate-50 text-slate-900 select-none overflow-hidden relative font-sans ${className}`}
-      style={{ touchAction: "none" }}
     >
       {/* ------------------------------------------------------------------ */}
       {/* 1. Header (Clean, Modern CHEMAI Style)                             */}
@@ -760,16 +844,16 @@ export default function MobileMolecularEditor({
       )}
 
       {/* ------------------------------------------------------------------ */}
-      {/* 2. Molecular Drawing Canvas (SVG with Matrix Mapping)              */}
+      {/* 2. Molecular Drawing Canvas (SVG with Exact Matrix Mapping)        */}
       {/* ------------------------------------------------------------------ */}
-      <div className="flex-1 relative w-full h-full bg-slate-50 overflow-hidden cursor-crosshair">
+      <div ref={canvasContainerRef} className="flex-1 relative w-full h-full bg-slate-50 overflow-hidden cursor-crosshair">
         <svg
           ref={svgRef}
           className="w-full h-full block touch-none"
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
           role="region"
           aria-label="Molecular drawing canvas"
         >
@@ -782,7 +866,10 @@ export default function MobileMolecularEditor({
           <rect width="100%" height="100%" fill="url(#dot-grid)" />
 
           {/* Molecule Container (Centered + Pan + Zoom) */}
-          <g transform={`translate(${dimensions.width / 2 + pan.x}, ${dimensions.height / 2 + pan.y}) scale(${zoom})`}>
+          <g
+            ref={worldGroupRef}
+            transform={`translate(${dimensions.width / 2 + pan.x}, ${dimensions.height / 2 + pan.y}) scale(${zoom})`}
+          >
             {/* Bonds */}
             {mol.bonds.map((b) => {
               const a1 = getAtom(mol, b.a);
@@ -1005,60 +1092,89 @@ export default function MobileMolecularEditor({
           </g>
         </svg>
 
-        {/* Empty Canvas Starter Card */}
+        {/* Compact, Non-Obstructive Empty Canvas Instructions */}
         {mol.atoms.length === 0 && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center pointer-events-none z-10">
-            <div className="bg-white/95 border border-slate-200 rounded-2xl p-5 shadow-lg max-w-xs w-full backdrop-blur-sm pointer-events-auto flex flex-col items-center gap-3 animate-in fade-in">
-              <div className="w-12 h-12 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-600 flex items-center justify-center text-xl font-bold">
-                ✏️
-              </div>
-              <div>
-                <h3 className="text-sm font-bold text-slate-900">Start Drawing Molecule</h3>
-                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                  Tap anywhere on the canvas to place an atom, or pick a starter template below:
-                </p>
-              </div>
+          <div className="absolute top-3 left-3 right-16 flex flex-col items-start pointer-events-none z-10 animate-in fade-in duration-150">
+            <div className="bg-white/95 border border-slate-200/90 rounded-2xl p-3 shadow-md max-w-sm w-full backdrop-blur-sm pointer-events-auto">
+              <div className="flex items-start gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-200 text-indigo-600 flex items-center justify-center text-sm font-bold shrink-0">
+                  ✏️
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-semibold text-slate-800 leading-snug">
+                    Tap to start drawing. Select an element or drag from an atom to create a bond.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const { mol: nextM } = addAtom(EMPTY_MOL, -20, 0, "C");
+                        const { mol: chainM } = addAtom(nextM, 20, 0, "C");
+                        const chained = addBond(chainM, chainM.atoms[0].id, chainM.atoms[1].id, 1);
+                        pushState(chained);
+                        setTimeout(handleFitToScreen, 50);
+                        showToast("Added C—C chain");
+                      }}
+                      className="px-2.5 py-1 text-2xs font-semibold bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-800 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                    >
+                      <span>—</span>
+                      <span>C—C Chain</span>
+                    </button>
 
-              <div className="flex flex-wrap gap-2 justify-center w-full mt-1">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const { mol: nextM } = addAtom(EMPTY_MOL, 0, 0, "C");
-                    const { mol: chainM } = addAtom(nextM, 40, 0, "C");
-                    const chained = addBond(chainM, chainM.atoms[0].id, chainM.atoms[1].id, 1);
-                    pushState(chained);
-                    setTimeout(handleFitToScreen, 50);
-                    showToast("Added C-C starter bond");
-                  }}
-                  className="px-3 py-1.5 min-h-[38px] text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
-                >
-                  <span>—</span>
-                  <span>C—C Bond</span>
-                </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        pushState(placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true));
+                        setTimeout(handleFitToScreen, 50);
+                        showToast("Placed Benzene ring");
+                      }}
+                      className="px-2.5 py-1 text-2xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                    >
+                      <span>⬡</span>
+                      <span>Benzene</span>
+                    </button>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    pushState(placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true));
-                    setTimeout(handleFitToScreen, 50);
-                    showToast("Placed Benzene ring");
-                  }}
-                  className="px-3 py-1.5 min-h-[38px] text-xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
-                >
-                  <span>⬡</span>
-                  <span>Benzene</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setShowSearchModal(true)}
-                  className="px-3 py-1.5 min-h-[38px] text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
-                >
-                  <span>🔍</span>
-                  <span>Search</span>
-                </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        pushState(placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, false));
+                        setTimeout(handleFitToScreen, 50);
+                        showToast("Placed Cyclohexane ring");
+                      }}
+                      className="px-2.5 py-1 text-2xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                    >
+                      <span>⬡</span>
+                      <span>Cyclohexane</span>
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Selected Atom / Bond Status Pill with 1-Tap Deselect */}
+        {(selectedAtomId != null || selectedBondId != null) && (
+          <div className="absolute bottom-3 left-3 z-20 flex items-center gap-2 bg-white/95 border border-slate-200 rounded-xl px-3 py-1.5 shadow-md backdrop-blur-xs animate-in fade-in slide-in-from-bottom-1">
+            <span className="text-2xs font-semibold text-slate-500 uppercase tracking-wider">
+              Selected:
+            </span>
+            <span className="text-xs font-bold text-indigo-700">
+              {selectedAtomId != null
+                ? `Atom ${getAtom(mol, selectedAtomId)?.el || ""}`
+                : `Bond (${getBond(mol, selectedBondId)?.order === 1 ? "Single" : getBond(mol, selectedBondId)?.order === 2 ? "Double" : "Triple"})`}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedAtomId(null);
+                setSelectedBondId(null);
+              }}
+              className="ml-1 text-2xs text-slate-500 hover:text-slate-800 font-semibold px-1.5 py-0.5 rounded bg-slate-100 hover:bg-slate-200 transition-colors cursor-pointer"
+              title="Deselect"
+            >
+              Deselect
+            </button>
           </div>
         )}
 
