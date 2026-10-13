@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
+import { API_ROUTES } from "../config/api";
 
 // Curated compound presets for testing compound-focused context
 const PRESET_COMPOUNDS = [
@@ -81,13 +82,31 @@ function formatSubscripts(formula) {
   return formula.replace(/\d/g, (d) => subscriptMap[d] || d);
 }
 
+// Safely normalize compound data from navigation state, presets, or PubChem
+function normalizeCompound(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    name: raw.name || "Identified Molecule",
+    formula: raw.formula || raw.molecularFormula || "",
+    weight: raw.weight || (raw.molecularWeight ? (typeof raw.molecularWeight === "number" ? `${raw.molecularWeight} g/mol` : String(raw.molecularWeight)) : ""),
+    cid: raw.cid || null,
+    smiles: raw.smiles || raw.canonicalSmiles || raw.inputSmiles || "",
+    iupac: raw.iupac || raw.iupacName || "",
+    category: raw.category || "PubChem Compound",
+    description: raw.description || raw.wikipedia?.extract || "",
+    casNumber: raw.casNumber || "",
+    synonyms: Array.isArray(raw.synonyms) ? raw.synonyms : [],
+    wikipediaUrl: raw.wikipediaUrl || raw.wikipedia?.url || null,
+  };
+}
+
 export default function Chat() {
   const location = useLocation();
 
   // Active compound context: initialized from navigation state or defaults to null (General Chemistry)
   const [selectedCompound, setSelectedCompound] = useState(() => {
     if (location.state?.compound) {
-      return location.state.compound;
+      return normalizeCompound(location.state.compound);
     }
     return null;
   });
@@ -103,6 +122,8 @@ export default function Chat() {
 
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+  const lastExecutedKeyRef = useRef(null);
+  const handleSendMessageRef = useRef(null);
 
   // Auto-scroll to bottom whenever messages or loading state changes
   useEffect(() => {
@@ -127,12 +148,14 @@ export default function Chat() {
   };
 
   // Submit a question to the backend chat API
-  const handleSendMessage = async (textToSend = inputValue) => {
+  const handleSendMessage = async (textToSend = inputValue, compoundOverride = undefined) => {
     if (loading) return;
     const trimmed = (textToSend || "").trim();
     if (!trimmed) return;
 
     setApiError(null);
+
+    const activeCompound = compoundOverride !== undefined ? compoundOverride : selectedCompound;
 
     const timestamp = new Date().toLocaleTimeString([], {
       hour: "2-digit",
@@ -144,7 +167,7 @@ export default function Chat() {
       sender: "user",
       text: trimmed,
       timestamp,
-      compoundContext: selectedCompound,
+      compoundContext: activeCompound,
     };
 
     // Capture conversation history for follow-ups
@@ -165,22 +188,23 @@ export default function Chat() {
     const payload = {
       message: trimmed,
       history: currentHistory,
-      compound: selectedCompound
+      compound: activeCompound
         ? {
-            name: selectedCompound.name,
-            formula: selectedCompound.formula,
-            weight: selectedCompound.weight,
-            cid: selectedCompound.cid,
-            smiles: selectedCompound.smiles,
-            iupac: selectedCompound.iupac,
-            category: selectedCompound.category,
-            description: selectedCompound.description,
+            name: activeCompound.name,
+            formula: activeCompound.formula,
+            weight: activeCompound.weight,
+            cid: activeCompound.cid,
+            smiles: activeCompound.smiles,
+            iupac: activeCompound.iupac,
+            category: activeCompound.category,
+            description: activeCompound.description,
+            casNumber: activeCompound.casNumber,
           }
         : null,
     };
 
     try {
-      const res = await fetch("http://localhost:5000/api/chat", {
+      const res = await fetch(API_ROUTES.chat, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -203,7 +227,7 @@ export default function Chat() {
           hour: "2-digit",
           minute: "2-digit",
         }),
-        compoundContext: selectedCompound,
+        compoundContext: activeCompound,
         provider: data.provider,
         model: data.model,
       };
@@ -217,12 +241,12 @@ export default function Chat() {
       const errorMessage = {
         id: `assistant-err-${Date.now()}`,
         sender: "assistant",
-        text: `⚠️ **Unable to complete chemistry query**\n\n${errMsg}\n\n*Please ensure your backend server is running and a valid API key is configured.*`,
+        text: `⚠️ **Unable to complete chemistry query**\n\n${errMsg}\n\n*Please ensure your ChemAI server or Cloudflare API is reachable with a valid API key.*`,
         timestamp: new Date().toLocaleTimeString([], {
           hour: "2-digit",
           minute: "2-digit",
         }),
-        compoundContext: selectedCompound,
+        compoundContext: activeCompound,
         isError: true,
       };
 
@@ -231,6 +255,35 @@ export default function Chat() {
       setLoading(false);
     }
   };
+
+  handleSendMessageRef.current = handleSendMessage;
+
+  // Synchronize incoming navigation state (e.g. from Explain Structure or Ask ChemAI)
+  useEffect(() => {
+    const rawCompound = location.state?.compound;
+    const initialPrompt = location.state?.initialPrompt;
+
+    if (rawCompound) {
+      const norm = normalizeCompound(rawCompound);
+      setSelectedCompound(norm);
+
+      const executionKey = `${norm.name || "compound"}-${initialPrompt || ""}`;
+      if (initialPrompt && lastExecutedKeyRef.current !== executionKey) {
+        lastExecutedKeyRef.current = executionKey;
+        if (handleSendMessageRef.current) {
+          handleSendMessageRef.current(initialPrompt, norm);
+        }
+      }
+    } else if (initialPrompt) {
+      const executionKey = `general-${initialPrompt}`;
+      if (lastExecutedKeyRef.current !== executionKey) {
+        lastExecutedKeyRef.current = executionKey;
+        if (handleSendMessageRef.current) {
+          handleSendMessageRef.current(initialPrompt, null);
+        }
+      }
+    }
+  }, [location.state]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -259,7 +312,7 @@ export default function Chat() {
     : GENERAL_EXAMPLE_QUESTIONS;
 
   return (
-    <div className="min-h-[calc(100vh-64px)] bg-slate-950 text-slate-100 flex flex-col lg:flex-row overflow-hidden">
+    <div className="min-h-[calc(100dvh-64px)] max-h-[calc(100dvh-64px)] h-[calc(100dvh-64px)] bg-slate-950 text-slate-100 flex flex-col lg:flex-row overflow-hidden">
       {/* Mobile Context Drawer Backdrop */}
       {showMobileContext && (
         <div
@@ -289,7 +342,7 @@ export default function Chat() {
           </div>
           <button
             onClick={() => setShowMobileContext(false)}
-            className="lg:hidden p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800"
+            className="lg:hidden p-2 min-h-[44px] min-w-[44px] rounded-md text-slate-400 hover:text-white hover:bg-slate-800 flex items-center justify-center cursor-pointer"
             aria-label="Close context drawer"
           >
             ✕
@@ -428,7 +481,8 @@ export default function Chat() {
                 </button>
                 <Link
                   to="/editor"
-                  className="w-full py-2 px-3 rounded-lg text-xs font-semibold bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 transition-colors flex items-center justify-center gap-1.5"
+                  state={selectedCompound ? { loadSmiles: selectedCompound.smiles, compound: selectedCompound } : null}
+                  className="w-full py-2.5 px-3 min-h-[44px] rounded-lg text-xs font-semibold bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
                 >
                   <span>🧪</span>
                   <span>Open in Molecular Editor</span>
@@ -525,39 +579,54 @@ export default function Chat() {
       {/* ========================================================= */}
       {/* RIGHT AREA: Main Chat Area & Conversation Feed            */}
       {/* ========================================================= */}
-      <main className="flex-1 flex flex-col h-[calc(100vh-64px)] overflow-hidden bg-slate-950">
+      <main className="flex-1 flex flex-col h-[calc(100dvh-64px)] max-h-[calc(100dvh-64px)] overflow-hidden bg-slate-950">
         {/* Top Control Bar */}
-        <div className="px-4 sm:px-6 py-3 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md flex items-center justify-between gap-3 shrink-0">
-          <div className="flex items-center gap-3">
-            {/* Mobile Context Drawer Toggle Button */}
+        <div className="px-3 sm:px-6 py-2.5 sm:py-3 border-b border-slate-800/80 bg-slate-900/70 backdrop-blur-md flex items-center justify-between gap-2 sm:gap-3 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            {/* Primary Return to Editor Action */}
+            <Link
+              to="/editor"
+              state={selectedCompound ? { loadSmiles: selectedCompound.smiles, compound: selectedCompound } : null}
+              className="inline-flex items-center gap-1.5 px-3 py-2 min-h-[44px] rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-xs sm:text-sm font-semibold text-cyan-300 border border-slate-700/80 hover:border-cyan-500/40 transition-colors shadow-2xs shrink-0 cursor-pointer"
+              title="Return to Ketcher Molecular Editor"
+            >
+              <span className="text-base font-bold">←</span>
+              <span className="hidden sm:inline">Return to</span>
+              <span>Editor</span>
+            </Link>
+
+            {/* Mobile Context Drawer Toggle */}
             <button
               onClick={() => setShowMobileContext(true)}
-              className="lg:hidden px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-200 flex items-center gap-1.5 cursor-pointer"
+              className="lg:hidden px-2.5 py-2 min-h-[44px] rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-xs font-semibold text-cyan-300 flex items-center gap-1.5 cursor-pointer max-w-[130px] sm:max-w-[180px] truncate"
+              title="Open Compound Details Drawer"
             >
               <span>⬡</span>
-              <span>{selectedCompound ? selectedCompound.name : "Context"}</span>
+              <span className="truncate">{selectedCompound ? selectedCompound.name : "Context"}</span>
             </button>
 
-            {/* Current Active Mode Badge */}
-            <div className="flex items-center gap-2">
-              <div className="hidden sm:flex items-center gap-1.5 text-xs text-slate-300">
-                <span className="text-slate-400 font-medium">Context:</span>
-                {selectedCompound ? (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 font-semibold font-mono">
-                    <span>{selectedCompound.name}</span>
+            {/* Desktop Active Mode Badge */}
+            <div className="hidden lg:flex items-center gap-2">
+              <span className="text-slate-400 font-medium text-xs">Active Mode:</span>
+              {selectedCompound ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 font-semibold font-mono text-xs">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>{selectedCompound.name}</span>
+                  {selectedCompound.formula && (
                     <span className="text-slate-400">({formatSubscripts(selectedCompound.formula)})</span>
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 font-semibold">
-                    General Chemistry Mode
-                  </span>
-                )}
-              </div>
+                  )}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs">
+                  <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                  <span>General Chemistry Mode</span>
+                </span>
+              )}
 
               {selectedCompound && (
                 <button
                   onClick={handleDetachCompound}
-                  className="hidden sm:inline-block text-[11px] text-slate-400 hover:text-rose-300 transition-colors cursor-pointer"
+                  className="text-[11px] text-slate-400 hover:text-rose-300 transition-colors cursor-pointer px-1 py-0.5"
                   title="Switch to unconstrained general chemistry"
                 >
                   (Detach)
@@ -566,26 +635,48 @@ export default function Chat() {
             </div>
           </div>
 
-          {/* Action buttons: Clear Chat & Link to Editor */}
-          <div className="flex items-center gap-2">
+          {/* Action buttons: Clear History */}
+          <div className="flex items-center gap-2 shrink-0">
             {messages.length > 0 && (
               <button
                 onClick={handleClearConversation}
-                className="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                className="px-3 py-2 min-h-[44px] rounded-lg text-xs font-semibold text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
               >
                 Clear History
               </button>
             )}
-
-            <Link
-              to="/editor"
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800/90 hover:bg-slate-800 text-cyan-300 border border-slate-700/80 hover:border-cyan-500/40 transition-all flex items-center gap-1"
-            >
-              <span>🧪</span>
-              <span className="hidden sm:inline">2D Editor</span>
-            </Link>
           </div>
         </div>
+
+        {/* Mobile Compound Quick Pill Bar (visible when compound attached on small screens) */}
+        {selectedCompound && (
+          <div className="lg:hidden px-3.5 py-1.5 bg-slate-900/90 border-b border-cyan-500/20 text-xs flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+              <span className="font-bold text-white truncate text-[11px]">{selectedCompound.name}</span>
+              {selectedCompound.formula && (
+                <span className="text-slate-400 font-mono text-[10px] shrink-0">
+                  ({formatSubscripts(selectedCompound.formula)})
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => setShowMobileContext(true)}
+                className="text-[11px] text-cyan-300 underline font-medium min-h-[36px] flex items-center cursor-pointer"
+              >
+                View Info
+              </button>
+              <button
+                onClick={handleDetachCompound}
+                className="text-[11px] text-rose-300 font-medium min-h-[36px] flex items-center cursor-pointer"
+                title="Switch to General Chemistry"
+              >
+                Detach
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Message Stream Area */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
@@ -788,26 +879,26 @@ export default function Chat() {
           )}
         </div>
 
-        {/* Input & Send Area (Always pinned at bottom) */}
-        <div className="p-4 sm:p-5 border-t border-slate-800/90 bg-slate-900/70 backdrop-blur-md shrink-0">
+        {/* Input & Send Area (Always pinned at bottom, mobile keyboard accessible) */}
+        <div className="sticky bottom-0 z-20 p-3 sm:p-5 border-t border-slate-800/90 bg-slate-900/85 backdrop-blur-md pb-[max(0.75rem,env(safe-area-inset-bottom))] shrink-0">
           <div className="max-w-3xl mx-auto space-y-2">
             {/* Context Notice Tag above input */}
             <div className="flex items-center justify-between text-[11px] px-1 text-slate-400">
-              <span className="flex items-center gap-1.5">
+              <span className="flex items-center gap-1.5 truncate">
                 <span
-                  className={`w-1.5 h-1.5 rounded-full ${
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                     selectedCompound ? "bg-emerald-400" : "bg-cyan-400"
                   }`}
                 />
                 {selectedCompound ? (
-                  <span>
+                  <span className="truncate">
                     Directing question to: <strong className="text-cyan-300">{selectedCompound.name}</strong>
                   </span>
                 ) : (
                   <span>General chemistry question mode</span>
                 )}
               </span>
-              <span className="hidden sm:inline text-slate-500 font-mono text-[10px]">
+              <span className="hidden sm:inline text-slate-500 font-mono text-[10px] shrink-0">
                 Enter to send • Shift+Enter for new line
               </span>
             </div>
@@ -828,13 +919,13 @@ export default function Chat() {
                     ? `Ask about ${selectedCompound.name} (e.g. reactivity, synthesis, functional groups)...`
                     : "Ask any chemistry question (e.g. SN1 vs SN2, aromaticity, pKa trends)..."
                 }
-                className="flex-1 bg-transparent border-0 text-slate-100 placeholder-slate-500 text-xs sm:text-sm resize-none focus:outline-hidden px-2 py-1.5 max-h-40 leading-relaxed disabled:opacity-50"
+                className="flex-1 bg-transparent border-0 text-slate-100 placeholder-slate-500 text-base sm:text-sm resize-none focus:outline-hidden px-2 py-2 min-h-[44px] max-h-40 leading-relaxed disabled:opacity-50"
               />
 
               <button
                 onClick={() => handleSendMessage()}
                 disabled={loading || !inputValue.trim()}
-                className={`p-2.5 rounded-lg font-bold text-xs sm:text-sm flex items-center justify-center transition-all cursor-pointer ${
+                className={`px-3.5 py-2.5 min-h-[44px] rounded-lg font-bold text-xs sm:text-sm flex items-center justify-center transition-all cursor-pointer ${
                   !loading && inputValue.trim()
                     ? "bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-md shadow-cyan-500/30 scale-100"
                     : "bg-slate-800 text-slate-500 cursor-not-allowed opacity-50"

@@ -46,3 +46,6 @@ Thumbs.db
 *.zip
 *.tar.gz
 *.tgz
+
+# Cloudflare Wrangler
+.wrangler/

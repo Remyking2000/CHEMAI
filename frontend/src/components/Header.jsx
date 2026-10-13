@@ -61,7 +61,7 @@ function Header() {
         <nav className="flex items-center gap-1.5 sm:gap-3">
           <Link
             to="/"
-            className={`px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-all ${
+            className={`px-3 py-2 min-h-[40px] rounded-lg text-xs sm:text-sm font-semibold transition-all flex items-center justify-center ${
               isHome
                 ? isDark
                   ? "bg-white/10 text-cyan-300 border border-cyan-400/30"
@@ -75,7 +75,7 @@ function Header() {
           </Link>
           <Link
             to="/chat"
-            className={`px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5 ${
+            className={`px-3 py-2 min-h-[40px] rounded-lg text-xs sm:text-sm font-semibold transition-all flex items-center justify-center gap-1.5 ${
               isChat
                 ? isDark
                   ? "bg-cyan-500/20 text-cyan-300 border border-cyan-400/40 shadow-xs"
@@ -90,7 +90,7 @@ function Header() {
           </Link>
           <Link
             to="/editor"
-            className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5 ${
+            className={`px-3.5 sm:px-4 py-2 min-h-[40px] rounded-lg text-xs sm:text-sm font-semibold transition-all flex items-center justify-center gap-1.5 ${
               isEditor
                 ? "bg-indigo-600 text-white shadow-xs"
                 : "bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-md shadow-cyan-500/25 hover:scale-[1.02]"

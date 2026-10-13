@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate, useLocation } from "react-router-dom";
 import { Editor } from "ketcher-react";
 import { ketcherProvider } from "ketcher-core";
 import { StandaloneStructServiceProvider } from "ketcher-standalone";
 import OCL from "openchemlib";
 import "ketcher-react/dist/index.css";
 import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
+import MobileMolecularEditor from "../components/MobileMolecularEditor";
+import { exportStructure } from "../lib/mobileMolecule";
+import { API_ROUTES } from "../config/api";
 
 // Ensure KetcherLogger has a safe fallback before Ketcher finishes async initialization
 if (typeof window !== "undefined" && !window.ketcher) {
@@ -41,54 +44,10 @@ const SAMPLE_STRUCTURES = [
   { name: "Caffeine", smiles: "Cn1cnc2c1c(=O)n(c(=O)n2C)C" },
 ];
 
-// Safely format and render explanation content regardless of whether it's a string, array, or object
-function renderExplanationField(field) {
-  if (!field) return "Not specified.";
-  if (typeof field === "string") return field;
-  if (Array.isArray(field)) {
-    return (
-      <div className="space-y-1.5">
-        {field.map((item, idx) => {
-          if (typeof item === "string") {
-            return (
-              <p key={idx} className="leading-relaxed">
-                {item}
-              </p>
-            );
-          }
-          if (item && typeof item === "object") {
-            return (
-              <div key={idx} className="bg-gray-50/80 p-2.5 rounded-md border border-gray-100 text-xs leading-relaxed">
-                {item.name && <strong className="font-semibold text-gray-900 block mb-0.5">{item.name}</strong>}
-                <span className="text-gray-700">{item.description || Object.values(item).join(" ")}</span>
-              </div>
-            );
-          }
-          return (
-            <p key={idx} className="leading-relaxed">
-              {String(item)}
-            </p>
-          );
-        })}
-      </div>
-    );
-  }
-  if (typeof field === "object") {
-    return (
-      <div className="space-y-1">
-        {Object.entries(field).map(([k, v], idx) => (
-          <div key={idx} className="text-xs">
-            <strong className="font-semibold text-gray-900">{k}: </strong>
-            <span className="text-gray-700">{typeof v === "object" ? JSON.stringify(v) : String(v)}</span>
-          </div>
-        ))}
-      </div>
-    );
-  }
-  return String(field);
-}
-
 export default function MolecularEditor() {
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const structServiceProvider = useMemo(
     () => new StandaloneStructServiceProvider(),
     []
@@ -107,10 +66,10 @@ export default function MolecularEditor() {
   const [identifyLoading, setIdentifyLoading] = useState(false);
   const [identifyError, setIdentifyError] = useState(null);
 
-  // Phase 2: Gemini Chemistry Explanation state
-  const [explainResult, setExplainResult] = useState(null);
-  const [explainLoading, setExplainLoading] = useState(false);
-  const [explainError, setExplainError] = useState(null);
+  // Phase 2 Explanation state setters (preserved for reset cascades)
+  const [, setExplainResult] = useState(null);
+  const [, setExplainLoading] = useState(false);
+  const [, setExplainError] = useState(null);
 
   // Phase 3A: Reverse Structure Lookup (Build Structure) state
   const [showBuildStructure, setShowBuildStructure] = useState(true);
@@ -133,6 +92,30 @@ export default function MolecularEditor() {
   const [analyzerResult, setAnalyzerResult] = useState(null);
   const [analyzerLoading, setAnalyzerLoading] = useState(false);
 
+  // Phase 4A: Mobile-first responsive view detection and manual override
+  const [isMobileViewport, setIsMobileViewport] = useState(
+    () => typeof window !== "undefined" && window.innerWidth < 768
+  );
+  const [viewModeOverride, setViewModeOverride] = useState(null); // 'mobile' | 'desktop' | null (auto)
+  const activeView = viewModeOverride || (isMobileViewport ? "mobile" : "desktop");
+
+  // Keep mobile molecule state for mobile editor & bidirectional sync
+  const [mobileMol, setMobileMol] = useState(null);
+  const [mobileInitialSmiles, setMobileInitialSmiles] = useState(null);
+
+  // Responsive listener for viewport width changes and orientation changes
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobileViewport(window.innerWidth < 768);
+    };
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("orientationchange", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("orientationchange", handleResize);
+    };
+  }, []);
+
   // Status notification
   const [statusMessage, setStatusMessage] = useState("");
 
@@ -149,6 +132,39 @@ export default function MolecularEditor() {
       if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
     };
   }, []);
+
+  // Bidirectional layout view switchers preserving molecular state
+  const handleSwitchToMobile = async () => {
+    try {
+      if (ketcher) {
+        const { smiles } = await getCurrentStructure();
+        if (smiles && smiles.trim()) {
+          setMobileInitialSmiles(smiles.trim());
+        }
+      }
+    } catch (e) {
+      console.warn("Could not sync Ketcher structure to mobile:", e);
+    }
+    setViewModeOverride("mobile");
+    showStatus("Switched to Mobile Molecular Editor view.");
+  };
+
+  const handleSwitchToDesktop = async () => {
+    try {
+      if (mobileMol && Array.isArray(mobileMol.atoms) && mobileMol.atoms.length > 0) {
+        const exported = exportStructure(mobileMol);
+        if (exported && exported.smiles) {
+          if (ketcher && typeof ketcher.setMolecule === "function") {
+            await ketcher.setMolecule(exported.smiles);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Could not sync mobile structure to Ketcher:", e);
+    }
+    setViewModeOverride("desktop");
+    showStatus("Switched to Desktop Ketcher Editor view.");
+  };
 
   const identifyLoadingRef = useRef(false);
   identifyLoadingRef.current = identifyLoading;
@@ -178,6 +194,27 @@ export default function MolecularEditor() {
     };
   }, [ketcher]);
 
+  // Restore structure from navigation state (e.g. returning from Chat)
+  useEffect(() => {
+    if (isEditorReady && ketcher && location.state?.loadSmiles) {
+      ketcher.setMolecule(location.state.loadSmiles).catch(console.error);
+      if (location.state?.compound) {
+        const c = location.state.compound;
+        setIdentifyResult({
+          name: c.name,
+          molecularFormula: c.formula,
+          molecularWeight: c.weight ? parseFloat(c.weight) : null,
+          cid: c.cid,
+          canonicalSmiles: c.smiles,
+          iupacName: c.iupac,
+          category: c.category,
+          wikipedia: c.description ? { extract: c.description } : null,
+          casNumber: c.casNumber,
+          synonyms: c.synonyms,
+        });
+      }
+    }
+  }, [isEditorReady, ketcher, location.state]);
 
   // Handler when Ketcher initializes
   const handleOnInit = (ketcherInstance) => {
@@ -229,8 +266,8 @@ export default function MolecularEditor() {
   };
 
   // Identify drawn molecule via backend POST /api/identify
-  const handleIdentifyMolecule = async () => {
-    if (!ketcher) {
+  const handleIdentifyMolecule = async (structureOverride = null) => {
+    if (!structureOverride && !ketcher) {
       showStatus("Editor is still initializing, please wait.");
       return;
     }
@@ -244,7 +281,13 @@ export default function MolecularEditor() {
     setExplainError(null);
 
     try {
-      const { smiles, molfile, atomCount } = await getCurrentStructure();
+      const { smiles, molfile, atomCount } = structureOverride
+        ? {
+            smiles: structureOverride.smiles || "",
+            molfile: structureOverride.molfile || "",
+            atomCount: structureOverride.atomCount ?? (structureOverride.smiles ? 1 : 0),
+          }
+        : await getCurrentStructure();
 
       // Check for empty canvas
       if ((!smiles && !molfile) || atomCount === 0) {
@@ -257,7 +300,7 @@ export default function MolecularEditor() {
         return;
       }
 
-      const res = await fetch("http://localhost:5000/api/identify", {
+      const res = await fetch(API_ROUTES.identify, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ smiles, molfile }),
@@ -291,7 +334,9 @@ export default function MolecularEditor() {
           setIdentifyError({
             type: "unavailable",
             title: "PubChem Service Busy or Timed Out",
-            message: data.error || "The upstream PubChem service is temporarily busy. Please try again shortly.",
+            message: data.error || "The upstream PubChem service is temporarily busy (rate limited). Please wait a moment and try again.",
+            fallbackCompound: data.fallbackCompound || null,
+            smiles: data.smiles || smiles,
           });
         } else {
           setIdentifyError({
@@ -310,129 +355,62 @@ export default function MolecularEditor() {
       setIdentifyError({
         type: "network_error",
         title: "Connection Failed",
-        message: "Could not connect to the CHEMAI backend server (http://localhost:5000). Please ensure the backend is running.",
+        message: "Could not connect to the CHEMAI backend server. Please ensure the backend service is running.",
       });
     } finally {
       setIdentifyLoading(false);
     }
   };
 
-  // Phase 2: Request Gemini chemistry explanation for the currently identified molecule
-  const handleExplainStructure = async () => {
-    if (!identifyResult || !identifyResult.cid) {
+  // Construct structured verified compound context for Chat navigation
+  const buildCompoundContext = (res = identifyResult) => {
+    if (!res) return null;
+    return {
+      name: res.name || "Identified Molecule",
+      formula: res.molecularFormula || res.formula || "",
+      weight: res.molecularWeight
+        ? typeof res.molecularWeight === "number"
+          ? `${res.molecularWeight} g/mol`
+          : String(res.molecularWeight)
+        : res.weight || "",
+      cid: res.cid || null,
+      smiles: res.canonicalSmiles || res.inputSmiles || res.smiles || "",
+      iupac: res.iupacName || res.iupac || "",
+      category: res.category || "PubChem Identified",
+      description: res.wikipedia?.extract || res.description || "",
+      casNumber: res.casNumber || "",
+      synonyms: Array.isArray(res.synonyms) ? res.synonyms : [],
+      wikipediaUrl: res.wikipedia?.url || null,
+    };
+  };
+
+  // Open ChemAI Chat with optional compound context and prompt
+  const handleOpenChat = (promptOverride = null) => {
+    let compound = identifyResult ? buildCompoundContext(identifyResult) : null;
+    if (!compound && identifyError?.fallbackCompound) {
+      compound = buildCompoundContext(identifyError.fallbackCompound);
+    }
+    navigate("/chat", {
+      state: {
+        compound,
+        initialPrompt: promptOverride || undefined,
+      },
+    });
+  };
+
+  // Phase 2 Unified: Open Chat and immediately generate explanation for identified molecule
+  const handleExplainStructure = () => {
+    if (!identifyResult) {
       showStatus("Identify a molecule first to generate a chemistry explanation.");
       return;
     }
-
-    if (explainLoading) return; // Prevent duplicate submissions
-
-    const smilesToSubmit =
-      identifyResult.inputSmiles || identifyResult.canonicalSmiles || "";
-    if (!smilesToSubmit.trim()) {
-      setExplainError({
-        type: "invalid",
-        title: "Missing Structure SMILES",
-        message: "No valid SMILES string is available for the currently identified compound.",
-      });
-      return;
-    }
-
-    setExplainLoading(true);
-    setExplainError(null);
-    setExplainResult(null);
-
-    try {
-      const res = await fetch("http://localhost:5000/api/explain-structure", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ smiles: smilesToSubmit }),
-      });
-
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { error: "Invalid JSON received from server", raw: text };
-      }
-
-      if (!res.ok) {
-        if (
-          data.configError ||
-          data.code === "AI_CONFIG_MISSING" ||
-          data.code === "GEMINI_CONFIG_MISSING" ||
-          data.code === "AI_AUTH_ERROR" ||
-          data.code === "GEMINI_AUTH_ERROR"
-        ) {
-          setExplainError({
-            type: "config_error",
-            title: "AI Configuration Required",
-            message:
-              data.error || "AI API key is not configured on the backend server.",
-            details:
-              data.details ||
-              "Set OPENROUTER_API_KEY in backend/.env (see backend/.env.example) and restart the backend server.",
-            code: data.code,
-          });
-        } else if (res.status === 404 || data.code === "UNIDENTIFIED_COMPOUND") {
-          setExplainError({
-            type: "unidentified",
-            title: "Identified Compound Required",
-            message:
-              data.error ||
-              "This phase supports chemistry explanations for identified PubChem compounds only.",
-            details: data.details,
-          });
-        } else if (res.status === 402 || data.code === "AI_CREDITS_DEPLETED") {
-          setExplainError({
-            type: "config_error",
-            title: "AI Credits Depleted",
-            message:
-              data.error || "Your AI provider credits or quota are depleted.",
-            details: data.details,
-          });
-        } else if (res.status === 429 || data.code === "AI_RATE_LIMIT" || data.code === "GEMINI_RATE_LIMIT") {
-          setExplainError({
-            type: "rate_limit",
-            title: "AI Rate Limit Reached",
-            message:
-              data.error ||
-              "AI rate limit reached. Please wait a moment and try again.",
-            details: data.details,
-          });
-        } else if (res.status === 504 || data.code === "AI_TIMEOUT" || data.code === "GEMINI_TIMEOUT") {
-          setExplainError({
-            type: "timeout",
-            title: "Explanation Request Timed Out",
-            message:
-              data.error ||
-              "The AI explanation request timed out. Please try again shortly.",
-          });
-        } else {
-          setExplainError({
-            type: "service_error",
-            title: "Explanation Service Error",
-            message:
-              data.error ||
-              "Unable to generate chemistry explanation at this time.",
-            details: data.details,
-          });
-        }
-      } else {
-        setExplainResult(data);
-        showStatus(`Generated chemistry explanation for ${identifyResult.name}!`);
-      }
-    } catch (err) {
-      console.error("Explain structure fetch error:", err);
-      setExplainError({
-        type: "network_error",
-        title: "Connection Failed",
-        message:
-          "Could not connect to the CHEMAI backend server (http://localhost:5000). Please ensure the backend is running.",
-      });
-    } finally {
-      setExplainLoading(false);
-    }
+    const compound = buildCompoundContext(identifyResult);
+    navigate("/chat", {
+      state: {
+        compound,
+        initialPrompt: `Explain the molecular structure, functional groups, and chemical properties of ${identifyResult.name} (${identifyResult.molecularFormula || ""}).`,
+      },
+    });
   };
 
   // Export current molecular structure
@@ -504,6 +482,8 @@ export default function MolecularEditor() {
       setIdentifyError(null);
       setExplainResult(null);
       setExplainError(null);
+      setMobileMol(null);
+      setMobileInitialSmiles("");
       showStatus("Structure canvas cleared.");
     } catch (err) {
       console.error("Failed to clear structure:", err);
@@ -514,6 +494,8 @@ export default function MolecularEditor() {
         setIdentifyError(null);
         setExplainResult(null);
         setExplainError(null);
+        setMobileMol(null);
+        setMobileInitialSmiles("");
         showStatus("Structure canvas cleared.");
       } catch (e) {
         console.error("Fallback clear failed:", e);
@@ -523,6 +505,7 @@ export default function MolecularEditor() {
 
   // Load a sample structure into Ketcher
   const handleLoadSample = async (smiles, name) => {
+    setMobileInitialSmiles(smiles);
     if (!ketcher) return;
     try {
       // Clear previous identification and explanation results
@@ -574,7 +557,7 @@ export default function MolecularEditor() {
     setAnalyzerResult(null);
 
     try {
-      const res = await fetch("http://localhost:5000/api/analyze", {
+      const res = await fetch(API_ROUTES.analyze, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ compound: analyzerQuery.trim() }),
@@ -665,7 +648,7 @@ export default function MolecularEditor() {
     setSelectedCandidateCid(null);
 
     try {
-      const res = await fetch("http://localhost:5000/api/lookup-structure", {
+      const res = await fetch(API_ROUTES.lookupStructure, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q, type: t }),
@@ -747,7 +730,7 @@ export default function MolecularEditor() {
         type: "network_error",
         title: "Connection Failed",
         message:
-          "Could not connect to the CHEMAI backend server (http://localhost:5000). Please ensure the backend is running.",
+          "Could not connect to the CHEMAI backend server. Please ensure the backend is reachable.",
       });
     } finally {
       setBuildLoading(false);
@@ -788,6 +771,7 @@ export default function MolecularEditor() {
       setExportData(null);
 
       setSelectedCandidateCid(candidate.cid);
+      setMobileInitialSmiles(candidate.smiles);
 
       await ketcher.setMolecule(candidate.smiles);
       showStatus(
@@ -837,7 +821,7 @@ export default function MolecularEditor() {
     setAiApproved(false);
 
     try {
-      const res = await fetch("http://localhost:5000/api/generate-structure", {
+      const res = await fetch(API_ROUTES.generateStructure, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q }),
@@ -911,7 +895,7 @@ export default function MolecularEditor() {
       setAiError({
         type: "network_error",
         title: "Connection Failed",
-        message: "Could not connect to CHEMAI backend server (http://localhost:5000).",
+        message: "Could not connect to CHEMAI backend service.",
       });
     } finally {
       setAiLoading(false);
@@ -975,6 +959,161 @@ export default function MolecularEditor() {
     showStatus("Discarded AI-generated candidate.");
   };
 
+  if (activeView === "mobile") {
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col overflow-x-hidden text-slate-100">
+        {/* Mobile-optimized workspace container */}
+        <div className="flex-1 flex flex-col h-[100dvh] max-h-[100dvh] relative">
+          <MobileMolecularEditor
+            initialMol={mobileMol}
+            initialSmiles={mobileInitialSmiles}
+            onIdentify={(exported) => handleIdentifyMolecule(exported)}
+            identifyLoading={identifyLoading}
+            onOpenChat={() => handleOpenChat()}
+            onSwitchToDesktop={handleSwitchToDesktop}
+            onStructureChange={(newMol) => {
+              setMobileMol(newMol);
+              setIdentifyResult(null);
+              setIdentifyError(null);
+            }}
+            onSearchCandidate={async (query) => {
+              const res = await fetch(`/api/search-structure?query=${encodeURIComponent(query)}&type=auto`);
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || "PubChem search failed");
+              return data.candidates || [];
+            }}
+            className="flex-1"
+          />
+
+          {/* If an identification result or error exists, show a responsive card/drawer */}
+          {(identifyResult || identifyError) && (
+            <div className="absolute inset-x-0 bottom-0 z-40 max-h-[75vh] overflow-y-auto bg-slate-900 border-t border-slate-700 rounded-t-2xl shadow-2xl p-4 animate-in slide-in-from-bottom duration-200">
+              {/* Close / Dismiss Bar */}
+              <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-800">
+                <span className="text-xs font-bold text-slate-300">
+                  {identifyResult ? "PubChem Verified Compound" : "Identification Notice"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIdentifyResult(null);
+                    setIdentifyError(null);
+                  }}
+                  className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-xs"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Verified Result Card */}
+              {identifyResult && (
+                <div className="space-y-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h3 className="text-base font-bold text-white leading-tight">
+                        {identifyResult.name}
+                      </h3>
+                      <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-xs text-cyan-300">
+                        <span className="bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800">
+                          {identifyResult.molecularFormula || identifyResult.formula}
+                        </span>
+                        {identifyResult.molecularWeight && (
+                          <span className="bg-slate-800 px-2 py-0.5 rounded text-slate-300">
+                            {identifyResult.molecularWeight} g/mol
+                          </span>
+                        )}
+                        {identifyResult.cid && (
+                          <span className="bg-slate-800 px-2 py-0.5 rounded text-slate-400">
+                            CID: {identifyResult.cid}
+                          </span>
+                        )}
+                        {identifyResult.casNumber && (
+                          <span className="bg-slate-800 px-2 py-0.5 rounded text-slate-400">
+                            CAS: {identifyResult.casNumber}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {identifyResult.iupacName && (
+                    <div className="text-2xs text-slate-400 font-mono break-all bg-slate-950/60 p-2 rounded border border-slate-800">
+                      <span className="text-slate-500 block uppercase font-sans font-bold mb-0.5">IUPAC Name:</span>
+                      {identifyResult.iupacName}
+                    </div>
+                  )}
+
+                  {/* Actions: Explain Structure & Ask ChemAI */}
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={handleExplainStructure}
+                      className="min-h-[44px] px-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow-md"
+                    >
+                      <ChemAINeuralHexIcon className="w-4 h-4 text-violet-200" />
+                      <span>Explain</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenChat()}
+                      className="min-h-[44px] px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow-md"
+                    >
+                      <span>✨</span>
+                      <span>Ask ChemAI</span>
+                    </button>
+                  </div>
+
+                  {identifyResult.cid && (
+                    <div className="pt-1 text-center">
+                      <a
+                        href={`https://pubchem.ncbi.nlm.nih.gov/compound/${identifyResult.cid}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-2xs text-cyan-400 hover:underline"
+                      >
+                        View Full PubChem Compound Record #{identifyResult.cid} ↗
+                      </a>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Error Notice */}
+              {identifyError && (
+                <div className="space-y-3">
+                  <div className="flex items-start gap-2.5 text-amber-400">
+                    <span className="text-lg">⚠️</span>
+                    <div>
+                      <h4 className="font-bold text-sm text-white">{identifyError.title}</h4>
+                      <p className="text-xs text-slate-300 mt-0.5">{identifyError.message}</p>
+                    </div>
+                  </div>
+                  {identifyError.details && (
+                    <p className="text-2xs text-slate-400 font-mono bg-slate-950 p-2 rounded">
+                      {identifyError.details}
+                    </p>
+                  )}
+                  {identifyError.smiles && (
+                    <div className="pt-2">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenChat(`Can you help me analyze this structure with SMILES: ${identifyError.smiles}?`)}
+                        className="w-full min-h-[44px] px-4 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white font-semibold text-xs flex items-center justify-center gap-2"
+                      >
+                        <ChemAINeuralHexIcon className="w-4 h-4 text-cyan-200" />
+                        <span>Ask ChemAI to Analyze Structure</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
       {/* Top Navigation & Workspace Header */}
@@ -1004,95 +1143,138 @@ export default function MolecularEditor() {
             </p>
           </div>
 
-          {/* Action Toolbar */}
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Quick Templates */}
-            <div className="flex items-center gap-1 bg-gray-100 p-1 rounded-lg border border-gray-200">
-              <span className="text-xs font-medium text-gray-500 px-2">Samples:</span>
+          {/* Action Toolbar — Logically Grouped & Responsive */}
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* Primary Action Group: Identification & Central AI */}
+            <div className="flex items-center gap-2">
+              {/* Identify Molecule (Primary action on canvas structure) */}
+              <button
+                type="button"
+                onClick={handleIdentifyMolecule}
+                disabled={!isEditorReady || identifyLoading}
+                className="px-4 py-2.5 min-h-[44px] text-xs sm:text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-2 shadow-sm cursor-pointer"
+                title="Query PubChem PUG REST with current structure to identify compound"
+              >
+                {identifyLoading ? (
+                  <>
+                    <span className="animate-spin text-sm">⏳</span>
+                    <span>Identifying...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>🔬</span>
+                    <span>Identify Molecule</span>
+                  </>
+                )}
+              </button>
+
+              {/* Central AI: Ask ChemAI */}
+              <button
+                type="button"
+                onClick={() => handleOpenChat()}
+                className="px-4 py-2.5 min-h-[44px] text-xs sm:text-sm font-semibold text-white bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 active:from-cyan-700 active:to-blue-700 rounded-lg shadow-sm transition-all flex items-center gap-2 cursor-pointer"
+                title="Open ChemAI Conversational Assistant"
+              >
+                <ChemAINeuralHexIcon className="w-4 h-4 text-cyan-200" />
+                <span>Ask ChemAI</span>
+                {identifyResult && (
+                  <span className="hidden sm:inline-block text-[10px] bg-white/20 px-1.5 py-0.5 rounded font-mono truncate max-w-[90px]">
+                    {identifyResult.name}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {/* Canvas Tools Group */}
+            <div className="flex flex-wrap items-center gap-1.5 bg-gray-100 p-1 rounded-lg border border-gray-200">
+              <span className="text-[11px] font-semibold text-gray-500 px-1.5 hidden sm:inline">Samples:</span>
               {SAMPLE_STRUCTURES.map((sample) => (
                 <button
                   key={sample.name}
+                  type="button"
                   onClick={() => handleLoadSample(sample.smiles, sample.name)}
                   disabled={!isEditorReady}
-                  className="px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-blue-50 hover:text-blue-700 rounded border border-gray-200 disabled:opacity-50 transition-colors shadow-2xs cursor-pointer"
+                  className="px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-gray-700 bg-white hover:bg-blue-50 hover:text-blue-700 rounded border border-gray-200 disabled:opacity-50 transition-colors shadow-2xs cursor-pointer"
                   title={`Load ${sample.name} (${sample.smiles})`}
                 >
                   {sample.name}
                 </button>
               ))}
+
+              <div className="h-5 w-px bg-gray-300 mx-1 hidden sm:block" />
+
+              {/* Clear Structure */}
+              <button
+                type="button"
+                onClick={handleClearStructure}
+                disabled={!isEditorReady}
+                className="px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-gray-700 bg-white hover:bg-red-50 hover:text-red-700 hover:border-red-300 rounded border border-gray-200 disabled:opacity-50 transition-colors flex items-center gap-1 shadow-2xs cursor-pointer"
+                title="Clear all atoms and bonds from canvas"
+              >
+                <span>✕</span> Clear
+              </button>
+
+              {/* Export Structure */}
+              <button
+                type="button"
+                onClick={handleExportStructure}
+                disabled={!isEditorReady || exportLoading}
+                className="px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 hover:text-blue-700 rounded border border-gray-200 disabled:opacity-50 transition-colors flex items-center gap-1 shadow-2xs cursor-pointer"
+                title="Export structure as SMILES and Molfile"
+              >
+                {exportLoading ? (
+                  <span>⏳ Exporting...</span>
+                ) : (
+                  <>
+                    <span>📤</span> Export
+                  </>
+                )}
+              </button>
             </div>
 
-            {/* Clear Structure */}
-            <button
-              onClick={handleClearStructure}
-              disabled={!isEditorReady}
-              className="px-3.5 py-2 text-sm font-medium text-gray-700 bg-white hover:bg-red-50 hover:text-red-700 hover:border-red-300 rounded-lg border border-gray-300 disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
-              title="Clear all atoms and bonds from canvas"
-            >
-              <span>✕</span> Clear Canvas
-            </button>
+            {/* Structure Search & Builder Group */}
+            <div className="flex items-center gap-1.5">
+              {/* Build Structure Toggle */}
+              <button
+                type="button"
+                onClick={() => setShowBuildStructure(!showBuildStructure)}
+                className={`px-3 py-2 min-h-[38px] text-xs sm:text-sm font-semibold rounded-lg border transition-all flex items-center gap-1.5 shadow-2xs cursor-pointer ${
+                  showBuildStructure
+                    ? "bg-sky-50 border-sky-400 text-sky-800 ring-2 ring-sky-200"
+                    : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50 hover:text-sky-700"
+                }`}
+                title="Toggle Search & Build panel to search PubChem by name or formula"
+              >
+                <span>🏗️</span>
+                <span>{showBuildStructure ? "Hide Builder" : "Search & Build"}</span>
+              </button>
 
-            {/* Export Structure */}
-            <button
-              onClick={handleExportStructure}
-              disabled={!isEditorReady || exportLoading}
-              className="px-3.5 py-2 text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 hover:text-blue-700 rounded-lg border border-gray-300 disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
-              title="Export structure as SMILES and Molfile"
-            >
-              {exportLoading ? (
-                <>
-                  <span className="animate-spin text-sm">⏳</span> Exporting...
-                </>
-              ) : (
-                <>
-                  <span>⬇</span> Export Structure
-                </>
-              )}
-            </button>
+              {/* Compound Analyzer Toggle */}
+              <button
+                type="button"
+                onClick={() => setShowAnalyzer(!showAnalyzer)}
+                className={`px-3 py-2 min-h-[38px] text-xs sm:text-sm font-medium rounded-lg border transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer ${
+                  showAnalyzer
+                    ? "bg-blue-50 border-blue-300 text-blue-700"
+                    : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"
+                }`}
+                title="Toggle PubChem Compound Analyzer lookup"
+              >
+                <span>🔍</span>
+                <span>{showAnalyzer ? "Hide Analyzer" : "Analyzer"}</span>
+              </button>
 
-            {/* Phase 3A: Build Structure Toggle */}
-            <button
-              onClick={() => setShowBuildStructure(!showBuildStructure)}
-              className={`px-3.5 py-2 text-sm font-semibold rounded-lg border transition-all flex items-center gap-1.5 shadow-2xs cursor-pointer ${
-                showBuildStructure
-                  ? "bg-sky-50 border-sky-400 text-sky-800 ring-2 ring-sky-200"
-                  : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50 hover:text-sky-700"
-              }`}
-              title="Toggle Build Structure panel to search PubChem by name or formula"
-            >
-              <span>🏗️</span> {showBuildStructure ? "Hide Builder" : "Build Structure"}
-            </button>
-
-            {/* Phase 1B: Primary Action — Identify Molecule */}
-            <button
-              onClick={handleIdentifyMolecule}
-              disabled={!isEditorReady || identifyLoading}
-              className="px-4 py-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-sm cursor-pointer"
-              title="Query PubChem PUG REST with current structure to identify compound"
-            >
-              {identifyLoading ? (
-                <>
-                  <span className="animate-spin text-sm">⏳</span> Identifying Molecule...
-                </>
-              ) : (
-                <>
-                  <span>🔬</span> Identify Molecule
-                </>
-              )}
-            </button>
-
-            {/* Compound Analyzer Toggle (Preserved Functionality) */}
-            <button
-              onClick={() => setShowAnalyzer(!showAnalyzer)}
-              className={`px-3.5 py-2 text-sm font-medium rounded-lg border transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer ${
-                showAnalyzer
-                  ? "bg-blue-50 border-blue-300 text-blue-700"
-                  : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"
-              }`}
-              title="Toggle PubChem Compound Analyzer lookup"
-            >
-              <span>🔍</span> {showAnalyzer ? "Hide Analyzer" : "Compound Analyzer"}
-            </button>
+              {/* View Mode Switcher: Switch to Mobile Editor */}
+              <button
+                type="button"
+                onClick={handleSwitchToMobile}
+                className="px-3 py-2 min-h-[38px] text-xs sm:text-sm font-semibold rounded-lg border border-purple-300 bg-purple-50 text-purple-700 hover:bg-purple-100 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                title="Switch to Mobile-First Molecular Editor"
+              >
+                <span>📱</span>
+                <span>Mobile View</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1143,40 +1325,40 @@ export default function MolecularEditor() {
                 )}
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
+                  type="button"
                   onClick={handleExplainStructure}
-                  disabled={!identifyResult?.cid || explainLoading}
-                  className="px-3.5 py-1.5 text-xs sm:text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 active:bg-violet-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
-                  title="Generate an educational chemistry explanation using AI"
+                  className="px-3.5 py-2 min-h-[40px] text-xs sm:text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 active:bg-violet-800 rounded-lg transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                  title="Open ChemAI Chat and generate full chemistry explanation"
                 >
-                  {explainLoading ? (
-                    <>
-                      <span className="animate-spin text-xs">⏳</span> Explaining...
-                    </>
-                  ) : (
-                    <>
-                      <ChemAINeuralHexIcon className="w-4 h-4 text-violet-100" />
-                      <span>Explain Structure</span>
-                    </>
-                  )}
+                  <ChemAINeuralHexIcon className="w-4 h-4 text-violet-100" />
+                  <span>Explain Structure</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenChat()}
+                  className="px-3.5 py-2 min-h-[40px] text-xs sm:text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-lg transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                  title="Open ChemAI Chat to ask custom questions about this compound"
+                >
+                  <span>✨</span>
+                  <span>Ask ChemAI</span>
                 </button>
                 <a
                   href={`https://pubchem.ncbi.nlm.nih.gov/compound/${identifyResult.cid}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 bg-white px-3 py-1.5 rounded-lg border border-indigo-200 hover:border-indigo-300 transition-colors shadow-2xs flex items-center gap-1"
+                  className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 bg-white px-3 py-2 min-h-[40px] rounded-lg border border-indigo-200 hover:border-indigo-300 transition-colors shadow-2xs flex items-center gap-1 cursor-pointer"
                 >
-                  <span>View on PubChem</span>
+                  <span>PubChem</span>
                   <span>↗</span>
                 </a>
                 <button
+                  type="button"
                   onClick={() => {
                     setIdentifyResult(null);
-                    setExplainResult(null);
-                    setExplainError(null);
                   }}
-                  className="text-gray-400 hover:text-gray-600 text-sm p-1 cursor-pointer"
+                  className="text-gray-400 hover:text-gray-600 p-2 min-h-[40px] min-w-[40px] flex items-center justify-center cursor-pointer text-sm"
                   title="Close identification results"
                 >
                   ✕
@@ -1320,179 +1502,100 @@ export default function MolecularEditor() {
                 </div>
               )}
 
-              {/* Phase 2: Gemini Chemistry Explanation Loading State */}
-              {explainLoading && (
-                <div className="mt-4 bg-violet-50/70 border border-violet-200 rounded-xl p-5 flex items-center gap-4">
-                  <div className="w-8 h-8 border-3 border-violet-600 border-t-transparent rounded-full animate-spin shrink-0"></div>
-                  <div>
-                    <h4 className="text-sm font-bold text-violet-950">
-                      Generating AI Chemistry Explanation...
-                    </h4>
-                    <p className="text-xs text-violet-700 mt-0.5">
-                      Analyzing verified PubChem structure ({identifyResult.name}, {identifyResult.molecularFormula}) for functional groups, bonding, and educational insights.
-                    </p>
+              {/* Connected ChemAI Conversational Inquiries Hub */}
+              <div className="mt-4 bg-gradient-to-br from-indigo-50/80 via-white to-violet-50/60 rounded-xl p-4 sm:p-5 border border-indigo-200/90 shadow-2xs space-y-3.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-2.5 border-b border-indigo-100">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-2xs shrink-0">
+                      <ChemAINeuralHexIcon className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-indigo-950">
+                        ChemAI Conversational Assistant
+                      </h4>
+                      <p className="text-[11px] text-indigo-700">
+                        Ask questions, explore reaction mechanisms, or generate full chemistry explanations
+                      </p>
+                    </div>
                   </div>
-                </div>
-              )}
-
-              {/* Phase 2: AI Explanation Error / Configuration Notice */}
-              {explainError && (
-                <div
-                  className={`mt-4 rounded-xl p-5 border flex items-start justify-between gap-4 ${
-                    explainError.type === "config_error"
-                      ? "bg-amber-50/90 border-amber-300"
-                      : "bg-red-50/90 border-red-300"
-                  }`}
-                >
-                  <div className="flex items-start gap-3.5">
-                    <div
-                      className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-base shrink-0 ${
-                        explainError.type === "config_error"
-                          ? "bg-amber-100 text-amber-800"
-                          : "bg-red-100 text-red-700"
-                      }`}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleExplainStructure}
+                      className="px-3 py-1.5 min-h-[38px] text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                      title="Open AI Chat and generate full chemistry explanation"
                     >
-                      {explainError.type === "config_error" ? "🔑" : "⚠️"}
-                    </div>
-                    <div>
-                      <h4 className="text-sm font-bold text-gray-900">
-                        {explainError.title || "Explanation Unavailable"}
-                      </h4>
-                      <p className="text-sm text-gray-800 mt-0.5">
-                        {explainError.message}
-                      </p>
-                      {explainError.details && (
-                        <p className="text-xs text-gray-600 mt-1.5 font-mono bg-white/80 px-2.5 py-1.5 rounded border border-gray-200">
-                          {explainError.details}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setExplainError(null)}
-                    className="text-gray-400 hover:text-gray-600 text-sm cursor-pointer"
-                    title="Dismiss explanation notice"
-                  >
-                    ✕
-                  </button>
-                </div>
-              )}
-
-              {/* Phase 2: AI Chemistry Explanation Panel */}
-              {explainResult && explainResult.explanation && (
-                <div className="mt-4 bg-gradient-to-br from-violet-50/60 via-white to-indigo-50/40 rounded-xl border-2 border-violet-200 overflow-hidden shadow-xs">
-                  {/* Panel Header */}
-                  <div className="bg-violet-100/70 px-5 py-3 border-b border-violet-200 flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <ChemAINeuralHexIcon className="w-5 h-5 text-violet-700" />
-                      <h3 className="text-sm font-bold text-violet-950">
-                        {explainResult.source?.startsWith("openrouter") ? "OpenRouter Chemistry Assistant" : "AI Chemistry Explanation Assistant"}
-                      </h3>
-                      <span className="text-xs bg-violet-200/80 text-violet-900 px-2 py-0.5 rounded-full font-mono font-medium">
-                        {explainResult.model || "openrouter/free"}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs bg-white text-gray-600 px-2.5 py-0.5 rounded-full border border-violet-200 font-medium">
-                        Educational Interpretation (Verify Independently)
-                      </span>
-                      <button
-                        onClick={() => setExplainResult(null)}
-                        className="text-gray-400 hover:text-gray-600 text-sm p-1 cursor-pointer"
-                        title="Close explanation panel"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Distinction Banner: Reference Data vs AI Interpretation */}
-                  <div className="px-5 py-2.5 bg-indigo-50/70 border-b border-violet-100 text-xs text-indigo-950 flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <span className="font-bold uppercase tracking-wider text-indigo-700 mr-1.5">
-                        Verified PubChem Reference:
-                      </span>
-                      <span className="font-semibold">{explainResult.referenceData?.name || identifyResult.name}</span>
-                      {" · "}
-                      <span className="font-mono">CID {explainResult.referenceData?.cid || identifyResult.cid}</span>
-                      {(explainResult.referenceData?.casNumber || identifyResult.casNumber) && (
-                        <>
-                          {" · "}
-                          <span className="font-mono">CAS {explainResult.referenceData?.casNumber || identifyResult.casNumber}</span>
-                        </>
-                      )}
-                      {" · "}
-                      <span className="font-mono">{explainResult.referenceData?.molecularFormula || identifyResult.molecularFormula}</span>
-                      {" · "}
-                      <span className="font-mono">{explainResult.referenceData?.molecularWeight || identifyResult.molecularWeight} g/mol</span>
-                    </div>
-                    <span className="text-[11px] text-indigo-700 font-medium">
-                      Source: PubChem PUG REST{(explainResult.referenceData?.wikipedia || identifyResult?.wikipedia) ? " & Wikipedia" : ""}
-                    </span>
-                  </div>
-
-                  {/* Structured Educational Sections */}
-                  <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="bg-white p-4 rounded-lg border border-gray-200 md:col-span-2">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
-                        1. What This Compound Is
-                      </h4>
-                      <div className="text-sm text-gray-800 leading-relaxed">
-                        {renderExplanationField(explainResult.explanation.whatItIs)}
-                      </div>
-                    </div>
-
-                    <div className="bg-white p-4 rounded-lg border border-gray-200">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
-                        2. Formula & Basic Structural Features
-                      </h4>
-                      <div className="text-sm text-gray-800 leading-relaxed">
-                        {renderExplanationField(explainResult.explanation.formulaAndStructure)}
-                      </div>
-                    </div>
-
-                    <div className="bg-white p-4 rounded-lg border border-gray-200">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
-                        3. Functional Groups & Their Roles
-                      </h4>
-                      <div className="text-sm text-gray-800 leading-relaxed">
-                        {renderExplanationField(explainResult.explanation.functionalGroups)}
-                      </div>
-                    </div>
-
-                    <div className="bg-white p-4 rounded-lg border border-gray-200">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
-                        4. Bonding & Structural Characteristics
-                      </h4>
-                      <div className="text-sm text-gray-800 leading-relaxed">
-                        {renderExplanationField(explainResult.explanation.bondingAndCharacteristics)}
-                      </div>
-                    </div>
-
-                    <div className="bg-white p-4 rounded-lg border border-gray-200">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
-                        5. Why These Features Matter
-                      </h4>
-                      <div className="text-sm text-gray-800 leading-relaxed">
-                        {renderExplanationField(explainResult.explanation.whyItMatters)}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Verification & Uncertainty Disclaimer Footer */}
-                  <div className="px-5 py-3 bg-amber-50/70 border-t border-amber-200 text-xs text-amber-900 space-y-1">
-                    <div className="leading-relaxed">
-                      <span className="font-bold">⚠️ Verification Note: </span>
-                      <span>{renderExplanationField(explainResult.explanation.uncertaintyAndVerificationNote)}</span>
-                    </div>
-                    {explainResult.disclaimer && (
-                      <p className="text-[11px] text-amber-800">
-                        {explainResult.disclaimer}
-                      </p>
-                    )}
+                      <ChemAINeuralHexIcon className="w-3.5 h-3.5" />
+                      <span>Explain Structure</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenChat()}
+                      className="px-3 py-1.5 min-h-[38px] text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                      title="Open AI Chat with this compound attached"
+                    >
+                      <span>💬</span>
+                      <span>Ask Custom Query</span>
+                    </button>
                   </div>
                 </div>
-              )}
+
+                <div>
+                  <span className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider block mb-2">
+                    Quick Chemistry Inquiries:
+                  </span>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleOpenChat(
+                          `What functional groups are present in ${identifyResult.name}, and how do they determine its reactivity and acid-base behavior?`
+                        )
+                      }
+                      className="p-2.5 text-left rounded-lg bg-white hover:bg-indigo-50/70 border border-indigo-100 hover:border-indigo-300 text-xs text-gray-700 hover:text-indigo-950 transition-all flex items-center justify-between group cursor-pointer shadow-2xs"
+                    >
+                      <span>🔬 Functional groups & reactivity</span>
+                      <span className="text-indigo-400 group-hover:translate-x-0.5 transition-transform">→</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleOpenChat(
+                          `Describe the primary synthetic routes, precursors, and retrosynthetic disconnections for ${identifyResult.name}.`
+                        )
+                      }
+                      className="p-2.5 text-left rounded-lg bg-white hover:bg-indigo-50/70 border border-indigo-100 hover:border-indigo-300 text-xs text-gray-700 hover:text-indigo-950 transition-all flex items-center justify-between group cursor-pointer shadow-2xs"
+                    >
+                      <span>⚗️ Synthesis & reaction pathways</span>
+                      <span className="text-indigo-400 group-hover:translate-x-0.5 transition-transform">→</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleOpenChat(
+                          `What are the characteristic ¹H-NMR, ¹³C-NMR, and IR spectroscopic peaks for ${identifyResult.name}?`
+                        )
+                      }
+                      className="p-2.5 text-left rounded-lg bg-white hover:bg-indigo-50/70 border border-indigo-100 hover:border-indigo-300 text-xs text-gray-700 hover:text-indigo-950 transition-all flex items-center justify-between group cursor-pointer shadow-2xs"
+                    >
+                      <span>📊 NMR & IR spectroscopy signatures</span>
+                      <span className="text-indigo-400 group-hover:translate-x-0.5 transition-transform">→</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleOpenChat(
+                          `What is the biological mechanism of action, pharmacology, or real-world application of ${identifyResult.name}?`
+                        )
+                      }
+                      className="p-2.5 text-left rounded-lg bg-white hover:bg-indigo-50/70 border border-indigo-100 hover:border-indigo-300 text-xs text-gray-700 hover:text-indigo-950 transition-all flex items-center justify-between group cursor-pointer shadow-2xs"
+                    >
+                      <span>💊 Biological mechanism & applications</span>
+                      <span className="text-indigo-400 group-hover:translate-x-0.5 transition-transform">→</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -1520,6 +1623,25 @@ export default function MolecularEditor() {
                   <p className="text-xs text-gray-500 mt-1">
                     Submitted SMILES: <code className="bg-gray-100 px-1 py-0.5 rounded font-mono">{identifyError.smiles}</code>
                   </p>
+                )}
+                {identifyError.type === "unavailable" && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleOpenChat(`Can you analyze this chemical structure: ${identifyError.smiles || "drawn molecule"}? Explain its functional groups and chemical properties.`)}
+                      className="px-3 py-1.5 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white text-xs font-semibold rounded-lg shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+                    >
+                      <ChemAINeuralHexIcon className="w-3.5 h-3.5" />
+                      <span>Ask ChemAI About This Structure</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleIdentifyMolecule}
+                      className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-medium rounded-lg transition-colors cursor-pointer"
+                    >
+                      Retry Identification
+                    </button>
+                  </div>
                 )}
               </div>
             </div>

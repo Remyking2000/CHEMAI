@@ -4,8 +4,12 @@ import axios from "axios";
 import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
+import { fileURLToPath } from "url";
 import { GoogleGenAI, Type } from "@google/genai";
 import OCL from "openchemlib";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
@@ -13,9 +17,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", service: "chemai-backend", port: 5000 });
+});
+
 const AXIOS_TIMEOUT = 10000; // ms
 const GEMINI_TIMEOUT = 25000; // ms
-const CACHE_DIR = path.resolve("./cache/pubchem_json");
+const CACHE_DIR = path.resolve(__dirname, "cache/pubchem_json");
 
 const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
@@ -269,6 +277,19 @@ async function readIdentifyCache(trimmedSmiles) {
     const raw = await fs.readFile(file, "utf8");
     return JSON.parse(raw);
   } catch {
+    // If exact SMILES is not cached, attempt lookup via OCL canonical SMILES
+    try {
+      if (OCL && typeof OCL.Molecule?.fromSmiles === "function") {
+        const mol = OCL.Molecule.fromSmiles(trimmedSmiles);
+        const canon = mol.toSmiles();
+        if (canon && canon !== trimmedSmiles) {
+          const safeCanon = `identify_${canon.replace(/[^a-z0-9._-]/gi, "_").toLowerCase()}`;
+          const canonFile = path.join(CACHE_DIR, `${safeCanon}.json`);
+          const rawCanon = await fs.readFile(canonFile, "utf8");
+          return JSON.parse(rawCanon);
+        }
+      }
+    } catch {}
     return null;
   }
 }
@@ -479,16 +500,15 @@ async function identifyStructureWithPubChem({ smiles, molfile, preferCache = fal
 
   const trimmedSmiles = resolvedSmiles.trim();
 
-  // Optional fast-path cache check when explaining an already-identified structure
-  if (preferCache) {
-    const cached = await readIdentifyCache(trimmedSmiles);
-    if (cached && cached.cid) {
-      return {
-        ok: true,
-        status: 200,
-        data: { ...cached, source: "cache" },
-      };
-    }
+  // Fast-path local cache check to prevent unnecessary PubChem API load & rate limits
+  const cached = await readIdentifyCache(trimmedSmiles);
+  if (cached && cached.cid) {
+    console.log("[/api/identify] served from cache for:", trimmedSmiles);
+    return {
+      ok: true,
+      status: 200,
+      data: { ...cached, source: "cache" },
+    };
   }
 
   try {
@@ -502,7 +522,10 @@ async function identifyStructureWithPubChem({ smiles, molfile, preferCache = fal
         cidUrl,
         new URLSearchParams({ smiles: trimmedSmiles }).toString(),
         {
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "ChemAI/1.0 (educational chemistry app; contact@chemai.local)",
+          },
           timeout: AXIOS_TIMEOUT,
         }
       );
@@ -561,8 +584,14 @@ async function identifyStructureWithPubChem({ smiles, molfile, preferCache = fal
     const synUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/synonyms/JSON`;
 
     const [propsSettled, synSettled] = await Promise.allSettled([
-      axios.get(propsUrl, { timeout: AXIOS_TIMEOUT }),
-      axios.get(synUrl, { timeout: AXIOS_TIMEOUT }),
+      axios.get(propsUrl, {
+        headers: { "User-Agent": "ChemAI/1.0 (educational chemistry app; contact@chemai.local)" },
+        timeout: AXIOS_TIMEOUT,
+      }),
+      axios.get(synUrl, {
+        headers: { "User-Agent": "ChemAI/1.0 (educational chemistry app; contact@chemai.local)" },
+        timeout: AXIOS_TIMEOUT,
+      }),
     ]);
 
     const props =
@@ -651,12 +680,32 @@ async function identifyStructureWithPubChem({ smiles, molfile, preferCache = fal
     }
 
     if (err?.response?.status === 429 || err?.response?.status === 503) {
+      let fallbackData = null;
+      try {
+        if (OCL && typeof OCL.Molecule?.fromSmiles === "function") {
+          const mol = OCL.Molecule.fromSmiles(trimmedSmiles);
+          const mf = mol.getMolecularFormula();
+          if (mf && mf.formula) {
+            fallbackData = {
+              name: `Drawn Compound (${mf.formula})`,
+              molecularFormula: mf.formula,
+              molecularWeight: String(Number(mf.relativeWeight || mf.absoluteWeight).toFixed(2)),
+              canonicalSmiles: mol.toSmiles() || trimmedSmiles,
+              inputSmiles: trimmedSmiles,
+              offlineEstimated: true,
+            };
+          }
+        }
+      } catch {}
+
       return {
         ok: false,
         status: 503,
         body: {
           error: "PubChem service is temporarily busy (rate limited). Please wait a moment and try again.",
           status: err?.response?.status,
+          fallbackCompound: fallbackData,
+          smiles: trimmedSmiles,
         },
       };
     }

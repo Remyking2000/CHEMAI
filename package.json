@@ -9,6 +9,12 @@
     "start:backend": "npm run start --prefix backend",
     "build:frontend": "npm run build --prefix frontend",
     "lint:frontend": "npm run lint --prefix frontend",
-    "install:all": "npm install --prefix frontend && npm install --prefix backend"
+    "install:all": "npm install --prefix frontend && npm install --prefix backend",
+    "cf:pages:build": "npm run build:frontend",
+    "cf:pages:dev": "wrangler pages dev frontend/dist --d1=DB=chemai-db",
+    "cf:pages:deploy": "npm run build:frontend && wrangler pages deploy frontend/dist",
+    "d1:create": "wrangler d1 create chemai-db",
+    "d1:migrate:local": "wrangler d1 migrations apply chemai-db --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply chemai-db --remote"
   }
 }
