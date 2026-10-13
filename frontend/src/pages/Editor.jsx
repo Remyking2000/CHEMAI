@@ -41,6 +41,53 @@ const SAMPLE_STRUCTURES = [
   { name: "Caffeine", smiles: "Cn1cnc2c1c(=O)n(c(=O)n2C)C" },
 ];
 
+// Safely format and render explanation content regardless of whether it's a string, array, or object
+function renderExplanationField(field) {
+  if (!field) return "Not specified.";
+  if (typeof field === "string") return field;
+  if (Array.isArray(field)) {
+    return (
+      <div className="space-y-1.5">
+        {field.map((item, idx) => {
+          if (typeof item === "string") {
+            return (
+              <p key={idx} className="leading-relaxed">
+                {item}
+              </p>
+            );
+          }
+          if (item && typeof item === "object") {
+            return (
+              <div key={idx} className="bg-gray-50/80 p-2.5 rounded-md border border-gray-100 text-xs leading-relaxed">
+                {item.name && <strong className="font-semibold text-gray-900 block mb-0.5">{item.name}</strong>}
+                <span className="text-gray-700">{item.description || Object.values(item).join(" ")}</span>
+              </div>
+            );
+          }
+          return (
+            <p key={idx} className="leading-relaxed">
+              {String(item)}
+            </p>
+          );
+        })}
+      </div>
+    );
+  }
+  if (typeof field === "object") {
+    return (
+      <div className="space-y-1">
+        {Object.entries(field).map(([k, v], idx) => (
+          <div key={idx} className="text-xs">
+            <strong className="font-semibold text-gray-900">{k}: </strong>
+            <span className="text-gray-700">{typeof v === "object" ? JSON.stringify(v) : String(v)}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return String(field);
+}
+
 export default function MolecularEditor() {
   const structServiceProvider = useMemo(
     () => new StandaloneStructServiceProvider(),
@@ -1390,54 +1437,54 @@ export default function MolecularEditor() {
                       <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
                         1. What This Compound Is
                       </h4>
-                      <p className="text-sm text-gray-800 leading-relaxed">
-                        {explainResult.explanation.whatItIs}
-                      </p>
+                      <div className="text-sm text-gray-800 leading-relaxed">
+                        {renderExplanationField(explainResult.explanation.whatItIs)}
+                      </div>
                     </div>
 
                     <div className="bg-white p-4 rounded-lg border border-gray-200">
                       <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
                         2. Formula & Basic Structural Features
                       </h4>
-                      <p className="text-sm text-gray-800 leading-relaxed">
-                        {explainResult.explanation.formulaAndStructure}
-                      </p>
+                      <div className="text-sm text-gray-800 leading-relaxed">
+                        {renderExplanationField(explainResult.explanation.formulaAndStructure)}
+                      </div>
                     </div>
 
                     <div className="bg-white p-4 rounded-lg border border-gray-200">
                       <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
                         3. Functional Groups & Their Roles
                       </h4>
-                      <p className="text-sm text-gray-800 leading-relaxed">
-                        {explainResult.explanation.functionalGroups}
-                      </p>
+                      <div className="text-sm text-gray-800 leading-relaxed">
+                        {renderExplanationField(explainResult.explanation.functionalGroups)}
+                      </div>
                     </div>
 
                     <div className="bg-white p-4 rounded-lg border border-gray-200">
                       <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
                         4. Bonding & Structural Characteristics
                       </h4>
-                      <p className="text-sm text-gray-800 leading-relaxed">
-                        {explainResult.explanation.bondingAndCharacteristics}
-                      </p>
+                      <div className="text-sm text-gray-800 leading-relaxed">
+                        {renderExplanationField(explainResult.explanation.bondingAndCharacteristics)}
+                      </div>
                     </div>
 
                     <div className="bg-white p-4 rounded-lg border border-gray-200">
                       <h4 className="text-xs font-bold uppercase tracking-wider text-violet-700 mb-1">
                         5. Why These Features Matter
                       </h4>
-                      <p className="text-sm text-gray-800 leading-relaxed">
-                        {explainResult.explanation.whyItMatters}
-                      </p>
+                      <div className="text-sm text-gray-800 leading-relaxed">
+                        {renderExplanationField(explainResult.explanation.whyItMatters)}
+                      </div>
                     </div>
                   </div>
 
                   {/* Verification & Uncertainty Disclaimer Footer */}
                   <div className="px-5 py-3 bg-amber-50/70 border-t border-amber-200 text-xs text-amber-900 space-y-1">
-                    <p>
+                    <div className="leading-relaxed">
                       <span className="font-bold">⚠️ Verification Note: </span>
-                      {explainResult.explanation.uncertaintyAndVerificationNote}
-                    </p>
+                      <span>{renderExplanationField(explainResult.explanation.uncertaintyAndVerificationNote)}</span>
+                    </div>
                     {explainResult.disclaimer && (
                       <p className="text-[11px] text-amber-800">
                         {explainResult.disclaimer}

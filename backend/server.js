@@ -176,6 +176,77 @@ async function callOpenRouter({
   return { text: "", model };
 }
 
+/**
+ * Send conversational multi-turn chat request to OpenRouter API
+ */
+async function callOpenRouterChat({
+  apiKey,
+  model,
+  systemInstruction,
+  messages,
+  timeoutMs,
+  maxTokens = 2048,
+  temperature = 0.3,
+}) {
+  const modelsToAttempt = [model];
+  if (!modelsToAttempt.includes("liquid/lfm-2.5-2.6b:free")) {
+    modelsToAttempt.push("liquid/lfm-2.5-2.6b:free");
+  }
+  if (!modelsToAttempt.includes("openrouter/free")) {
+    modelsToAttempt.push("openrouter/free");
+  }
+
+  const formattedMessages = [
+    { role: "system", content: systemInstruction },
+    ...messages.map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+    })),
+  ];
+
+  let lastError = null;
+  for (const candidateModel of modelsToAttempt) {
+    try {
+      const response = await axios.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+          model: candidateModel,
+          messages: formattedMessages,
+          temperature,
+          max_tokens: maxTokens,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5173",
+            "X-Title": "ChemAI",
+          },
+          timeout: timeoutMs,
+        }
+      );
+
+      const choice = response.data?.choices?.[0];
+      const rawText = choice?.message?.content?.trim() || "";
+      if (rawText) {
+        return {
+          text: rawText,
+          model: response.data?.model || candidateModel,
+        };
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(
+        `[callOpenRouterChat] candidate model ${candidateModel} failed:`,
+        err?.response?.data || err?.message
+      );
+    }
+  }
+
+  if (lastError) throw lastError;
+  return { text: "", model };
+}
+
 app.get("/api/test", (req, res) => {
   res.json({ message: "Backend is running fine!" });
 });
@@ -1507,6 +1578,28 @@ app.post("/api/explain-structure", async (req, res) => {
     });
   }
 
+function stringifyExplanationField(val, fallback = "") {
+  if (val === undefined || val === null) return fallback;
+  if (typeof val === "string") return val.trim();
+  if (Array.isArray(val)) {
+    return val
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          if (item.name && item.description) return `${item.name}: ${item.description}`;
+          if (item.name) return item.name;
+          return Object.entries(item).map(([k, v]) => `${k}: ${v}`).join("\n");
+        }
+        return String(item);
+      })
+      .join("\n\n");
+  }
+  if (typeof val === "object") {
+    return Object.entries(val).map(([k, v]) => `${k}: ${v}`).join("\n\n");
+  }
+  return String(val);
+}
+
   // 4. Check explanation cache
   const cacheKey = `${aiConfig.provider}_${aiConfig.activeModel}`;
   const cachedExplanation = await readExplainCache(compound.cid, cacheKey);
@@ -1514,8 +1607,20 @@ app.post("/api/explain-structure", async (req, res) => {
     console.log(
       `[/api/explain-structure] served cached explanation for CID ${compound.cid} (${compound.name}) via ${aiConfig.provider}`
     );
+    const normalizedExplanation = {
+      whatItIs: stringifyExplanationField(cachedExplanation.explanation.whatItIs),
+      formulaAndStructure: stringifyExplanationField(cachedExplanation.explanation.formulaAndStructure),
+      functionalGroups: stringifyExplanationField(cachedExplanation.explanation.functionalGroups),
+      bondingAndCharacteristics: stringifyExplanationField(cachedExplanation.explanation.bondingAndCharacteristics),
+      whyItMatters: stringifyExplanationField(cachedExplanation.explanation.whyItMatters),
+      uncertaintyAndVerificationNote: stringifyExplanationField(
+        cachedExplanation.explanation.uncertaintyAndVerificationNote,
+        "AI-generated chemical interpretations are for educational guidance and should be verified independently."
+      ),
+    };
     return res.json({
       ...cachedExplanation,
+      explanation: normalizedExplanation,
       source: `${aiConfig.provider}-cache`,
       referenceData,
     });
@@ -1636,14 +1741,15 @@ Provide a concise, accurate educational explanation covering:
       model: usedModel,
       referenceData,
       explanation: {
-        whatItIs: parsedExplanation.whatItIs || "",
-        formulaAndStructure: parsedExplanation.formulaAndStructure || "",
-        functionalGroups: parsedExplanation.functionalGroups || "",
-        bondingAndCharacteristics: parsedExplanation.bondingAndCharacteristics || "",
-        whyItMatters: parsedExplanation.whyItMatters || "",
-        uncertaintyAndVerificationNote:
-          parsedExplanation.uncertaintyAndVerificationNote ||
-          "AI-generated chemical interpretations are for educational guidance and should be verified independently.",
+        whatItIs: stringifyExplanationField(parsedExplanation.whatItIs),
+        formulaAndStructure: stringifyExplanationField(parsedExplanation.formulaAndStructure),
+        functionalGroups: stringifyExplanationField(parsedExplanation.functionalGroups),
+        bondingAndCharacteristics: stringifyExplanationField(parsedExplanation.bondingAndCharacteristics),
+        whyItMatters: stringifyExplanationField(parsedExplanation.whyItMatters),
+        uncertaintyAndVerificationNote: stringifyExplanationField(
+          parsedExplanation.uncertaintyAndVerificationNote,
+          "AI-generated chemical interpretations are for educational guidance and should be verified independently."
+        ),
       },
       disclaimer: `Reference data (Compound Name, CID, IUPAC Name, Formula, Molecular Weight, and Canonical SMILES) is retrieved directly from PubChem. The structural walk-through and functional group explanations are generated by ${aiConfig.provider === "openrouter" ? "OpenRouter AI" : "Gemini AI"} and may require independent verification.`,
       generatedAt: new Date().toISOString(),
@@ -1736,6 +1842,304 @@ Provide a concise, accurate educational explanation covering:
       details: safeMsg,
       code: "AI_UPSTREAM_ERROR",
       referenceData,
+    });
+  }
+});
+
+const CHAT_SYSTEM_INSTRUCTION = `You are ChemAI, an expert, encouraging, and accurate chemistry learning assistant designed for university students, educators, and researchers.
+
+Core Guidelines:
+1. Pedagogical Clarity: Explain concepts clearly, rigorously, and accurately, adapting depth to the user's question (from foundational organic/inorganic principles to advanced molecular theory).
+2. Molecular Context Grounding: If verified compound data is provided in the prompt, anchor your explanations to that molecule when relevant. Always distinguish verified supplied compound data (such as formula, IUPAC name, SMILES, CID) from general chemical reasoning.
+3. Scientific Integrity & Accuracy: Never fabricate molecular properties, PubChem CIDs, CAS numbers, or empirical data. If information is uncertain, unknown, or not verified, explicitly state your uncertainty.
+4. Honest Capabilities: Do not claim to run live laboratory experiments, molecular dynamics simulations, or real-time external database lookups during this conversation.
+5. Scope: Provide conversational chemistry explanations, conceptual guidance, functional group analysis, thermodynamic/kinetic reasoning, and educational insights. Do not generate unverifiable reaction yields or proprietary chemical synthesis recipes for dangerous substances.
+6. Universal Chemistry: If no compound is selected, answer general chemistry inquiries (e.g., periodic trends, thermodynamics, reaction kinetics, orbital theory, stereochemistry, acid-base equilibria) thoroughly and clearly.
+7. Format: Use clean, readable GitHub-flavored Markdown. Format chemical formulas clearly (e.g., C₉H₈O₄ or H2SO4) and highlight key terms, functional groups, and mechanisms.`;
+
+/**
+ * Phase 2: Dedicated Conversational AI Endpoint
+ * POST /api/chat
+ */
+app.post("/api/chat", async (req, res) => {
+  // 1. Validate payload structure
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    return res.status(400).json({
+      error: "Invalid request payload. Expected a JSON object.",
+      code: "INVALID_PAYLOAD",
+    });
+  }
+
+  const { message, history, compound } = req.body;
+
+  // 2. Validate current message
+  if (typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({
+      error: "Message is required and must be a non-empty string.",
+      code: "INVALID_MESSAGE",
+    });
+  }
+
+  if (message.length > 2500) {
+    return res.status(400).json({
+      error: "Message exceeds the maximum allowed length of 2,500 characters.",
+      code: "MESSAGE_TOO_LONG",
+    });
+  }
+
+  const trimmedMessage = message.trim();
+
+  // 3. Validate conversation history
+  const sanitizedHistory = [];
+  if (history !== undefined && history !== null) {
+    if (!Array.isArray(history)) {
+      return res.status(400).json({
+        error: "History must be an array of prior messages.",
+        code: "INVALID_HISTORY",
+      });
+    }
+
+    // Limit history to the most recent 20 messages for context safety & efficiency
+    const recentHistory = history.slice(-20);
+    for (const item of recentHistory) {
+      if (!item || typeof item !== "object") continue;
+      const role = item.sender === "user" || item.role === "user" ? "user" : "assistant";
+      const text = typeof (item.text || item.content) === "string" ? (item.text || item.content).trim() : "";
+      if (text) {
+        sanitizedHistory.push({
+          role,
+          content: text.slice(0, 2500),
+        });
+      }
+    }
+  }
+
+  // 4. Validate and sanitize optional compound context
+  let sanitizedCompound = null;
+  if (compound !== undefined && compound !== null) {
+    if (typeof compound !== "object" || Array.isArray(compound)) {
+      return res.status(400).json({
+        error: "Compound context must be an object if provided.",
+        code: "INVALID_COMPOUND",
+      });
+    }
+
+    sanitizedCompound = {
+      name: typeof compound.name === "string" ? compound.name.trim().slice(0, 150) : null,
+      formula: typeof compound.formula === "string" ? compound.formula.trim().slice(0, 50) : null,
+      weight:
+        typeof (compound.weight || compound.molecularWeight) === "string" ||
+        typeof (compound.weight || compound.molecularWeight) === "number"
+          ? String(compound.weight || compound.molecularWeight).trim().slice(0, 50)
+          : null,
+      smiles:
+        typeof (compound.smiles || compound.canonicalSmiles) === "string"
+          ? (compound.smiles || compound.canonicalSmiles).trim().slice(0, 500)
+          : null,
+      cid:
+        compound.cid || compound.pubchemCid
+          ? String(compound.cid || compound.pubchemCid).trim().slice(0, 30)
+          : null,
+      iupac:
+        typeof (compound.iupac || compound.iupacName) === "string"
+          ? (compound.iupac || compound.iupacName).trim().slice(0, 250)
+          : null,
+      category: typeof compound.category === "string" ? compound.category.trim().slice(0, 100) : null,
+      description:
+        typeof compound.description === "string" ? compound.description.trim().slice(0, 500) : null,
+    };
+
+    if (
+      !sanitizedCompound.name &&
+      !sanitizedCompound.formula &&
+      !sanitizedCompound.smiles &&
+      !sanitizedCompound.cid
+    ) {
+      sanitizedCompound = null;
+    }
+  }
+
+  // 5. Construct compound context block for prompt grounding
+  let compoundContextBlock = "";
+  if (sanitizedCompound) {
+    const details = [];
+    if (sanitizedCompound.name) details.push(`- Compound Name: ${sanitizedCompound.name}`);
+    if (sanitizedCompound.formula) details.push(`- Chemical Formula: ${sanitizedCompound.formula}`);
+    if (sanitizedCompound.weight) details.push(`- Molecular Weight: ${sanitizedCompound.weight}`);
+    if (sanitizedCompound.iupac) details.push(`- IUPAC Name: ${sanitizedCompound.iupac}`);
+    if (sanitizedCompound.cid) details.push(`- PubChem CID: ${sanitizedCompound.cid}`);
+    if (sanitizedCompound.smiles) details.push(`- Canonical SMILES: ${sanitizedCompound.smiles}`);
+    if (sanitizedCompound.category) details.push(`- Classification/Category: ${sanitizedCompound.category}`);
+    if (sanitizedCompound.description) details.push(`- Verified Lab Summary: ${sanitizedCompound.description}`);
+
+    compoundContextBlock = `[VERIFIED COMPOUND CONTEXT ATTACHED FROM LAB WORKSPACE]
+The student/researcher is actively inspecting the following compound:
+${details.join("\n")}
+
+Guidelines for this compound-focused dialogue:
+- Directly incorporate and reference these verified molecular properties when relevant.
+- Clearly distinguish the supplied verified structural facts from theoretical reasoning.
+- Do NOT fabricate non-existent physical properties, fake PubChem CIDs, or unverified constants.
+- If the user asks about reaction pathways, functional groups, or properties, relate them specifically to ${sanitizedCompound.name || "this structure"}.`;
+  }
+
+  // 6. Check AI configuration
+  const aiConfig = getAIConfig();
+  if (!aiConfig.isConfigured && !aiConfig.openRouter.isConfigured && !aiConfig.gemini.isConfigured) {
+    return res.status(503).json({
+      error: "AI service is not configured. Please set GEMINI_API_KEY or OPENROUTER_API_KEY in backend/.env.",
+      code: "AI_NOT_CONFIGURED",
+    });
+  }
+
+  let finalSystemInstruction = CHAT_SYSTEM_INSTRUCTION;
+  if (compoundContextBlock) {
+    finalSystemInstruction += `\n\n${compoundContextBlock}`;
+  }
+
+  // 7. Dispatch to configured AI provider with seamless fallback
+  try {
+    let replyText = "";
+    let usedProvider = aiConfig.provider;
+    let usedModel = aiConfig.activeModel;
+
+    if (aiConfig.provider === "gemini" && aiConfig.gemini.isConfigured) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: aiConfig.gemini.apiKey });
+
+        const contents = [];
+        for (const item of sanitizedHistory) {
+          contents.push({
+            role: item.role === "assistant" ? "model" : "user",
+            parts: [{ text: item.content }],
+          });
+        }
+        contents.push({
+          role: "user",
+          parts: [{ text: trimmedMessage }],
+        });
+
+        let timeoutHandle;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            const err = new Error("Gemini API request timed out");
+            err.code = "ETIMEDOUT";
+            reject(err);
+          }, GEMINI_TIMEOUT);
+        });
+
+        const generationPromise = ai.models.generateContent({
+          model: aiConfig.gemini.model,
+          contents,
+          config: {
+            systemInstruction: finalSystemInstruction,
+            temperature: 0.3,
+            maxOutputTokens: 2048,
+          },
+        });
+
+        const response = await Promise.race([generationPromise, timeoutPromise]);
+        clearTimeout(timeoutHandle);
+
+        replyText = response?.text ? response.text.trim() : "";
+        usedProvider = "gemini";
+        usedModel = aiConfig.gemini.model;
+      } catch (geminiErr) {
+        // If Gemini has depleted credits or errors, fall back to OpenRouter if available
+        if (aiConfig.openRouter.isConfigured) {
+          console.warn("[chat] Gemini provider failed, falling back to OpenRouter:", sanitizeErrorMessage(geminiErr.message));
+          const openRouterResult = await callOpenRouterChat({
+            apiKey: aiConfig.openRouter.apiKey,
+            model: aiConfig.openRouter.model,
+            systemInstruction: finalSystemInstruction,
+            messages: [
+              ...sanitizedHistory,
+              { role: "user", content: trimmedMessage },
+            ],
+            timeoutMs: GEMINI_TIMEOUT,
+            maxTokens: 2048,
+            temperature: 0.3,
+          });
+          replyText = openRouterResult.text;
+          usedProvider = "openrouter";
+          usedModel = openRouterResult.model;
+        } else {
+          throw geminiErr;
+        }
+      }
+    } else {
+      // Default to OpenRouter
+      const openRouterResult = await callOpenRouterChat({
+        apiKey: aiConfig.openRouter.apiKey,
+        model: aiConfig.openRouter.model,
+        systemInstruction: finalSystemInstruction,
+        messages: [
+          ...sanitizedHistory,
+          { role: "user", content: trimmedMessage },
+        ],
+        timeoutMs: GEMINI_TIMEOUT,
+        maxTokens: 2048,
+        temperature: 0.3,
+      });
+      replyText = openRouterResult.text;
+      usedProvider = "openrouter";
+      usedModel = openRouterResult.model;
+    }
+
+    if (!replyText) {
+      return res.status(502).json({
+        error: "AI service returned an empty response. Please try rephrasing your question.",
+        code: "EMPTY_MODEL_RESPONSE",
+      });
+    }
+
+    return res.json({
+      reply: replyText,
+      provider: usedProvider,
+      model: usedModel,
+      compoundContextApplied: Boolean(sanitizedCompound),
+    });
+  } catch (err) {
+    const rawMsg = err?.response?.data?.error?.message || err?.message || "Unknown error";
+    const safeMsg = sanitizeErrorMessage(rawMsg);
+    const status = err?.response?.status || err?.status;
+
+    console.error("[chat] Error communicating with AI provider:", safeMsg);
+
+    if (err.code === "ETIMEDOUT" || safeMsg.toLowerCase().includes("timeout")) {
+      return res.status(504).json({
+        error: "AI service timed out while generating chemistry response. Please try again.",
+        code: "AI_TIMEOUT",
+      });
+    }
+
+    if (status === 429 || safeMsg.toLowerCase().includes("rate limit") || safeMsg.toLowerCase().includes("quota")) {
+      return res.status(429).json({
+        error: "AI service rate limit or quota exceeded. Please wait a moment before trying again.",
+        details: safeMsg,
+        code: "AI_RATE_LIMIT",
+      });
+    }
+
+    if (
+      status === 401 ||
+      status === 402 ||
+      status === 403 ||
+      safeMsg.toLowerCase().includes("api key") ||
+      safeMsg.toLowerCase().includes("unauthorized") ||
+      safeMsg.toLowerCase().includes("credits are depleted")
+    ) {
+      return res.status(503).json({
+        error: "AI service authentication or billing issue. Please check your API key in backend/.env.",
+        details: safeMsg,
+        code: "AI_AUTH_ERROR",
+      });
+    }
+
+    return res.status(502).json({
+      error: "Unable to process chemistry chat request at this time.",
+      details: safeMsg,
+      code: "AI_UPSTREAM_ERROR",
     });
   }
 });
