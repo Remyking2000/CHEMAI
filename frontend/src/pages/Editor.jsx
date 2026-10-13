@@ -987,10 +987,10 @@ export default function MolecularEditor() {
 
           {/* If an identification result or error exists, show a responsive card/drawer */}
           {(identifyResult || identifyError) && (
-            <div className="absolute inset-x-0 bottom-0 z-40 max-h-[75vh] overflow-y-auto bg-slate-900 border-t border-slate-700 rounded-t-2xl shadow-2xl p-4 animate-in slide-in-from-bottom duration-200">
+            <div className="absolute inset-x-0 bottom-0 z-40 max-h-[75vh] overflow-y-auto bg-white border-t border-slate-200 rounded-t-2xl shadow-2xl p-4 animate-in slide-in-from-bottom duration-200">
               {/* Close / Dismiss Bar */}
-              <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-800">
-                <span className="text-xs font-bold text-slate-300">
+              <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-100">
+                <span className="text-xs font-bold text-slate-700">
                   {identifyResult ? "PubChem Verified Compound" : "Identification Notice"}
                 </span>
                 <button
@@ -999,7 +999,7 @@ export default function MolecularEditor() {
                     setIdentifyResult(null);
                     setIdentifyError(null);
                   }}
-                  className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-xs"
+                  className="w-7 h-7 rounded-full bg-slate-100 text-slate-500 hover:text-slate-900 flex items-center justify-center text-xs font-bold"
                 >
                   ✕
                 </button>
@@ -1010,25 +1010,25 @@ export default function MolecularEditor() {
                 <div className="space-y-3">
                   <div className="flex items-start justify-between gap-2">
                     <div>
-                      <h3 className="text-base font-bold text-white leading-tight">
+                      <h3 className="text-base font-bold text-slate-900 leading-tight">
                         {identifyResult.name}
                       </h3>
-                      <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-xs text-cyan-300">
-                        <span className="bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800">
+                      <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-xs text-indigo-700">
+                        <span className="bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded font-semibold">
                           {identifyResult.molecularFormula || identifyResult.formula}
                         </span>
                         {identifyResult.molecularWeight && (
-                          <span className="bg-slate-800 px-2 py-0.5 rounded text-slate-300">
+                          <span className="bg-slate-100 px-2 py-0.5 rounded text-slate-700">
                             {identifyResult.molecularWeight} g/mol
                           </span>
                         )}
                         {identifyResult.cid && (
-                          <span className="bg-slate-800 px-2 py-0.5 rounded text-slate-400">
+                          <span className="bg-slate-100 px-2 py-0.5 rounded text-slate-600">
                             CID: {identifyResult.cid}
                           </span>
                         )}
                         {identifyResult.casNumber && (
-                          <span className="bg-slate-800 px-2 py-0.5 rounded text-slate-400">
+                          <span className="bg-slate-100 px-2 py-0.5 rounded text-slate-600">
                             CAS: {identifyResult.casNumber}
                           </span>
                         )}
@@ -1037,8 +1037,8 @@ export default function MolecularEditor() {
                   </div>
 
                   {identifyResult.iupacName && (
-                    <div className="text-2xs text-slate-400 font-mono break-all bg-slate-950/60 p-2 rounded border border-slate-800">
-                      <span className="text-slate-500 block uppercase font-sans font-bold mb-0.5">IUPAC Name:</span>
+                    <div className="text-2xs text-slate-600 font-mono break-all bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                      <span className="text-slate-400 block uppercase font-sans font-bold mb-0.5 text-3xs">IUPAC Name:</span>
                       {identifyResult.iupacName}
                     </div>
                   )}
@@ -1048,15 +1048,15 @@ export default function MolecularEditor() {
                     <button
                       type="button"
                       onClick={handleExplainStructure}
-                      className="min-h-[44px] px-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow-md"
+                      className="min-h-[44px] px-3 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer"
                     >
-                      <ChemAINeuralHexIcon className="w-4 h-4 text-violet-200" />
+                      <ChemAINeuralHexIcon className="w-4 h-4 text-violet-100" />
                       <span>Explain</span>
                     </button>
                     <button
                       type="button"
                       onClick={() => handleOpenChat()}
-                      className="min-h-[44px] px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow-md"
+                      className="min-h-[44px] px-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer"
                     >
                       <span>✨</span>
                       <span>Ask ChemAI</span>
@@ -1069,7 +1069,7 @@ export default function MolecularEditor() {
                         href={`https://pubchem.ncbi.nlm.nih.gov/compound/${identifyResult.cid}`}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-2xs text-cyan-400 hover:underline"
+                        className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 hover:underline"
                       >
                         View Full PubChem Compound Record #{identifyResult.cid} ↗
                       </a>
@@ -1081,15 +1081,15 @@ export default function MolecularEditor() {
               {/* Error Notice */}
               {identifyError && (
                 <div className="space-y-3">
-                  <div className="flex items-start gap-2.5 text-amber-400">
+                  <div className="flex items-start gap-2.5 text-amber-600">
                     <span className="text-lg">⚠️</span>
                     <div>
-                      <h4 className="font-bold text-sm text-white">{identifyError.title}</h4>
-                      <p className="text-xs text-slate-300 mt-0.5">{identifyError.message}</p>
+                      <h4 className="font-bold text-sm text-slate-900">{identifyError.title}</h4>
+                      <p className="text-xs text-slate-600 mt-0.5">{identifyError.message}</p>
                     </div>
                   </div>
                   {identifyError.details && (
-                    <p className="text-2xs text-slate-400 font-mono bg-slate-950 p-2 rounded">
+                    <p className="text-2xs text-slate-600 font-mono bg-slate-50 p-2.5 rounded border border-slate-200">
                       {identifyError.details}
                     </p>
                   )}
@@ -1098,9 +1098,9 @@ export default function MolecularEditor() {
                       <button
                         type="button"
                         onClick={() => handleOpenChat(`Can you help me analyze this structure with SMILES: ${identifyError.smiles}?`)}
-                        className="w-full min-h-[44px] px-4 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white font-semibold text-xs flex items-center justify-center gap-2"
+                        className="w-full min-h-[44px] px-4 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-semibold text-xs flex items-center justify-center gap-2 shadow-sm transition-colors cursor-pointer"
                       >
-                        <ChemAINeuralHexIcon className="w-4 h-4 text-cyan-200" />
+                        <ChemAINeuralHexIcon className="w-4 h-4 text-cyan-100" />
                         <span>Ask ChemAI to Analyze Structure</span>
                       </button>
                     </div>

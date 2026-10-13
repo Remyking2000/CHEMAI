@@ -114,7 +114,7 @@ export function neighborIds(mol, atomId) {
   return out;
 }
 
-function hasDoubleBond(mol, atomId) {
+export function hasDoubleBond(mol, atomId) {
   return mol.bonds.some((b) => (b.a === atomId || b.b === atomId) && b.order >= 2);
 }
 
@@ -139,6 +139,22 @@ export function distToSegment(px, py, x1, y1, x2, y2) {
   let t = len2 ? ((px - x1) * dx + (py - y1) * dy) / len2 : 0;
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+export function findBondNear(mol, x, y, maxDist = BOND_LEN * 0.45) {
+  let best = null;
+  let bestD = maxDist;
+  for (const b of mol.bonds) {
+    const A = getAtom(mol, b.a);
+    const B = getAtom(mol, b.b);
+    if (!A || !B) continue;
+    const d = distToSegment(x, y, A.x, A.y, B.x, B.y);
+    if (d <= bestD) {
+      best = b;
+      bestD = d;
+    }
+  }
+  return best;
 }
 
 /* ------------------------------------------------------------------ */
@@ -258,16 +274,16 @@ export function addFragment(mol, x, y, order = 1) {
 }
 
 /** Bond from an existing atom (or a new atom at start) towards an end point, snapped to 30 degrees. */
-export function drawBondTo(mol, fromAtomId, start, end, order = 1) {
+export function drawBondTo(mol, fromAtomId, start, end, order = 1, el = "C") {
   let next = mol;
   let fromId = fromAtomId;
   if (fromId == null) {
-    const r = addAtom(next, start.x, start.y, "C");
+    const r = addAtom(next, start.x, start.y, el);
     next = r.mol;
     fromId = r.id;
   }
   const from = getAtom(next, fromId);
-  const target = findAtomNear(next, end.x, end.y, BOND_LEN * 0.45, [fromId]);
+  const target = findAtomNear(next, end.x, end.y, BOND_LEN * 0.55, [fromId]);
   if (target) return addBond(next, fromId, target.id, order);
 
   const raw = Math.atan2(end.y - from.y, end.x - from.x);
@@ -275,15 +291,15 @@ export function drawBondTo(mol, fromAtomId, start, end, order = 1) {
   const ang = Math.round(raw / step) * step;
   const px = from.x + BOND_LEN * Math.cos(ang);
   const py = from.y + BOND_LEN * Math.sin(ang);
-  const near = findAtomNear(next, px, py, BOND_LEN * 0.35, [fromId]);
+  const near = findAtomNear(next, px, py, BOND_LEN * 0.25, [fromId]);
   if (near) return addBond(next, fromId, near.id, order);
-  const r = addAtom(next, px, py, "C");
+  const r = addAtom(next, px, py, el);
   return addBond(r.mol, fromId, r.id, order);
 }
 
 /** Preview end point for the bond tool (same snapping as drawBondTo). */
 export function previewBondEnd(mol, from, end, fromAtomId) {
-  const target = findAtomNear(mol, end.x, end.y, BOND_LEN * 0.45, fromAtomId != null ? [fromAtomId] : []);
+  const target = findAtomNear(mol, end.x, end.y, BOND_LEN * 0.55, fromAtomId != null ? [fromAtomId] : []);
   if (target) return { x: target.x, y: target.y };
   const raw = Math.atan2(end.y - from.y, end.x - from.x);
   const step = Math.PI / 6;
@@ -309,15 +325,27 @@ function ringPoints(cx, cy, n, R, startAngle, dir = 1) {
  */
 export function placeRing(mol, n, target, aromatic = false) {
   let pts;
+  let attachToAtomId = null;
 
   if (target.type === "atom") {
     const a = getAtom(mol, target.id);
     if (!a) return mol;
-    const dir = neighborIds(mol, a.id).length ? freeDirection(mol, a.id) : -Math.PI / 2;
+    const nbs = neighborIds(mol, a.id);
     const R = BOND_LEN / (2 * Math.sin(Math.PI / n));
-    const cx = a.x + R * Math.cos(dir);
-    const cy = a.y + R * Math.sin(dir);
-    pts = ringPoints(cx, cy, n, R, dir + Math.PI);
+    if (nbs.length === 0) {
+      // Isolated starter atom: becomes vertex 0 of the ring
+      const dir = -Math.PI / 2;
+      const cx = a.x + R * Math.cos(dir);
+      const cy = a.y + R * Math.sin(dir);
+      pts = ringPoints(cx, cy, n, R, dir + Math.PI);
+    } else {
+      // Connected atom: attach substituent ring via single exocyclic bond in free direction
+      const dir = freeDirection(mol, a.id);
+      const cx = a.x + (BOND_LEN + R) * Math.cos(dir);
+      const cy = a.y + (BOND_LEN + R) * Math.sin(dir);
+      pts = ringPoints(cx, cy, n, R, dir + Math.PI);
+      attachToAtomId = a.id;
+    }
   } else if (target.type === "bond") {
     const bond = getBond(mol, target.id);
     if (!bond) return mol;
@@ -355,13 +383,31 @@ export function placeRing(mol, n, target, aromatic = false) {
 
   // merge vertices with existing atoms, create the rest
   let next = mol;
-  const ids = pts.map((p) => {
-    const ex = findAtomNear(next, p.x, p.y, BOND_LEN * 0.3);
-    if (ex) return ex.id;
-    const r = addAtom(next, p.x, p.y, "C");
-    next = r.mol;
-    return r.id;
-  });
+  let ids;
+
+  if (target.type === "bond") {
+    const bond = getBond(mol, target.id);
+    ids = [bond.a, bond.b];
+    for (let i = 2; i < pts.length; i++) {
+      const p = pts[i];
+      const ex = findAtomNear(next, p.x, p.y, BOND_LEN * 0.45, [bond.a, bond.b]);
+      if (ex) {
+        ids.push(ex.id);
+      } else {
+        const r = addAtom(next, p.x, p.y, "C");
+        next = r.mol;
+        ids.push(r.id);
+      }
+    }
+  } else {
+    ids = pts.map((p) => {
+      const ex = findAtomNear(next, p.x, p.y, BOND_LEN * 0.4);
+      if (ex) return ex.id;
+      const r = addAtom(next, p.x, p.y, "C");
+      next = r.mol;
+      return r.id;
+    });
+  }
 
   const edges = ids.map((id, i) => [id, ids[(i + 1) % ids.length]]).filter(([a, b]) => a !== b);
 
@@ -380,10 +426,19 @@ export function placeRing(mol, n, target, aromatic = false) {
     return { m, doubles };
   };
 
-  if (!aromatic) return build(next, 0).m;
-  const even = build(next, 0);
-  const odd = build(next, 1);
-  return odd.doubles > even.doubles ? odd.m : even.m;
+  let res;
+  if (!aromatic) {
+    res = build(next, 0).m;
+  } else {
+    const even = build(next, 0);
+    const odd = build(next, 1);
+    res = odd.doubles > even.doubles ? odd.m : even.m;
+  }
+
+  if (attachToAtomId != null && ids.length > 0) {
+    res = addBond(res, attachToAtomId, ids[0], 1);
+  }
+  return res;
 }
 
 /* ------------------------------------------------------------------ */
