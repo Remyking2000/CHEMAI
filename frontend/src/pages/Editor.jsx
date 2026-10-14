@@ -72,7 +72,7 @@ export default function MolecularEditor() {
   const [, setExplainError] = useState(null);
 
   // Phase 3A: Reverse Structure Lookup (Build Structure) state
-  const [showBuildStructure, setShowBuildStructure] = useState(true);
+  const [showBuildStructure, setShowBuildStructure] = useState(false);
   const [buildQuery, setBuildQuery] = useState("");
   const [buildType, setBuildType] = useState("auto"); // "auto" | "name" | "formula"
   const [buildLoading, setBuildLoading] = useState(false);
@@ -102,6 +102,7 @@ export default function MolecularEditor() {
   // Keep mobile molecule state for mobile editor & bidirectional sync
   const [mobileMol, setMobileMol] = useState(null);
   const [mobileInitialSmiles, setMobileInitialSmiles] = useState(null);
+  const pendingSmilesRef = useRef(null);
 
   // Responsive listener for viewport width changes and orientation changes
   useEffect(() => {
@@ -160,27 +161,31 @@ export default function MolecularEditor() {
   };
 
   const handleSwitchToDesktop = async () => {
+    let smilesToSync = "";
     try {
       if (mobileMol && Array.isArray(mobileMol.atoms) && mobileMol.atoms.length > 0) {
         const exported = exportStructure(mobileMol);
         if (exported && exported.smiles) {
-          if (ketcher && typeof ketcher.setMolecule === "function") {
-            await ketcher.setMolecule(exported.smiles);
-          }
-        }
-      } else {
-        // Clearing mobile clears corresponding desktop Ketcher structure
-        if (ketcher && typeof ketcher.setMolecule === "function") {
-          try {
-            await ketcher.setMolecule("");
-          } catch {
-            await ketcher.setMolecule("\n \n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END");
-          }
+          smilesToSync = exported.smiles;
         }
       }
     } catch (e) {
-      console.warn("Could not sync mobile structure to Ketcher:", e);
+      console.warn("Could not export mobile structure for desktop sync:", e);
     }
+
+    pendingSmilesRef.current = smilesToSync;
+    setMobileInitialSmiles(smilesToSync);
+
+    if (ketcher && typeof ketcher.setMolecule === "function") {
+      try {
+        await ketcher.setMolecule(smilesToSync || "");
+      } catch {
+        try {
+          await ketcher.setMolecule("\n \n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END");
+        } catch {}
+      }
+    }
+
     setViewModeOverride("desktop");
     showStatus("Switched to Desktop Ketcher Editor view.");
   };
@@ -236,12 +241,29 @@ export default function MolecularEditor() {
   }, [isEditorReady, ketcher, location.state]);
 
   // Handler when Ketcher initializes
-  const handleOnInit = (ketcherInstance) => {
+  const handleOnInit = async (ketcherInstance) => {
     // Ketcher's internal KetcherLogger expects window.ketcher to be set
     window.ketcher = ketcherInstance;
     setKetcher(ketcherInstance);
     setIsEditorReady(true);
     setEditorError(null);
+
+    // If there is a structure waiting to be loaded into desktop Ketcher (e.g. from mobile sync)
+    const toLoad = pendingSmilesRef.current || mobileInitialSmiles;
+    if (toLoad && typeof ketcherInstance.setMolecule === "function") {
+      try {
+        await ketcherInstance.setMolecule(toLoad);
+      } catch (err) {
+        console.warn("Could not sync pending structure into Ketcher on init:", err);
+      }
+      pendingSmilesRef.current = null;
+    }
+
+    // Restore window scroll to top if Ketcher's internal clipboard element jumped the page down
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    setTimeout(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    }, 150);
   };
 
   // Handler for Ketcher errors
@@ -256,14 +278,18 @@ export default function MolecularEditor() {
 
     let molfile = "";
     try {
-      molfile = await ketcher.getMolfile();
+      if (typeof ketcher.getMolfile === "function") {
+        molfile = await ketcher.getMolfile();
+      }
     } catch (err) {
       console.warn("getMolfile error:", err);
     }
 
     let smiles = "";
     try {
-      smiles = await ketcher.getSmiles();
+      if (typeof ketcher.getSmiles === "function") {
+        smiles = await ketcher.getSmiles();
+      }
     } catch (err) {
       console.warn("getSmiles error:", err);
     }
@@ -277,7 +303,18 @@ export default function MolecularEditor() {
           smiles = mol.toSmiles();
         }
       } catch (e) {
-        console.warn("OCL parse error:", e);
+        console.warn("OCL parse error on molfile:", e);
+      }
+    }
+
+    // Fallback: If OCL molfile parsing didn't count atoms, calculate atom count from SMILES
+    if (atomCount === 0 && smiles && smiles.trim()) {
+      try {
+        const mol = OCL.Molecule.fromSmiles(smiles.trim());
+        atomCount = mol.getAllAtoms();
+      } catch {
+        const matches = smiles.match(/[A-Z][a-z]?/g);
+        atomCount = matches ? matches.length : (smiles.length > 0 ? 1 : 0);
       }
     }
 
@@ -286,7 +323,17 @@ export default function MolecularEditor() {
 
   // Identify drawn molecule via backend POST /api/identify
   const handleIdentifyMolecule = async (structureOverride = null) => {
-    if (!structureOverride && !ketcher) {
+    // Guard against React SyntheticEvent objects when passed as onClick={handleIdentifyMolecule}
+    const isOverrideValid =
+      structureOverride &&
+      typeof structureOverride === "object" &&
+      !("nativeEvent" in structureOverride) &&
+      !("_reactName" in structureOverride) &&
+      Boolean(structureOverride.smiles || structureOverride.molfile);
+
+    const actualOverride = isOverrideValid ? structureOverride : null;
+
+    if (!actualOverride && !ketcher) {
       showStatus("Editor is still initializing, please wait.");
       return;
     }
@@ -300,16 +347,21 @@ export default function MolecularEditor() {
     setExplainError(null);
 
     try {
-      const { smiles, molfile, atomCount } = structureOverride
+      const { smiles, molfile, atomCount } = actualOverride
         ? {
-            smiles: structureOverride.smiles || "",
-            molfile: structureOverride.molfile || "",
-            atomCount: structureOverride.atomCount ?? (structureOverride.smiles ? 1 : 0),
+            smiles: (actualOverride.smiles || "").trim(),
+            molfile: actualOverride.molfile || "",
+            atomCount: actualOverride.atomCount ?? (actualOverride.smiles ? 1 : 0),
           }
         : await getCurrentStructure();
 
+      const hasStructure = Boolean(
+        (smiles && smiles.trim().length > 0) ||
+        (molfile && molfile.trim().length > 0 && atomCount > 0)
+      );
+
       // Check for empty canvas
-      if ((!smiles && !molfile) || atomCount === 0) {
+      if (!hasStructure) {
         setIdentifyError({
           type: "empty",
           title: "Canvas is Empty",
@@ -488,6 +540,15 @@ export default function MolecularEditor() {
 
   // Clear current molecular structure
   const handleClearStructure = async () => {
+    pendingSmilesRef.current = "";
+    setMobileMol(EMPTY_MOL);
+    setMobileInitialSmiles("");
+    setExportData(null);
+    setIdentifyResult(null);
+    setIdentifyError(null);
+    setExplainResult(null);
+    setExplainError(null);
+
     if (!ketcher) return;
 
     try {
@@ -496,25 +557,11 @@ export default function MolecularEditor() {
       } else if (typeof ketcher.setMolecule === "function") {
         await ketcher.setMolecule("");
       }
-      setExportData(null);
-      setIdentifyResult(null);
-      setIdentifyError(null);
-      setExplainResult(null);
-      setExplainError(null);
-      setMobileMol(null);
-      setMobileInitialSmiles("");
       showStatus("Structure canvas cleared.");
     } catch (err) {
       console.error("Failed to clear structure:", err);
       try {
         await ketcher.setMolecule("");
-        setExportData(null);
-        setIdentifyResult(null);
-        setIdentifyError(null);
-        setExplainResult(null);
-        setExplainError(null);
-        setMobileMol(null);
-        setMobileInitialSmiles("");
         showStatus("Structure canvas cleared.");
       } catch (e) {
         console.error("Fallback clear failed:", e);
@@ -524,14 +571,20 @@ export default function MolecularEditor() {
 
   // Load a sample structure into Ketcher
   const handleLoadSample = async (smiles, name) => {
+    pendingSmilesRef.current = smiles;
     setMobileInitialSmiles(smiles);
+    try {
+      setMobileMol(molFromSmiles(smiles));
+    } catch {}
+
+    // Clear previous identification and explanation results
+    setIdentifyResult(null);
+    setIdentifyError(null);
+    setExplainResult(null);
+    setExplainError(null);
+
     if (!ketcher) return;
     try {
-      // Clear previous identification and explanation results
-      setIdentifyResult(null);
-      setIdentifyError(null);
-      setExplainResult(null);
-      setExplainError(null);
       await ketcher.setMolecule(smiles);
       showStatus(`Loaded ${name} onto canvas.`);
       // Auto-refresh export if currently viewing
@@ -790,7 +843,11 @@ export default function MolecularEditor() {
       setExportData(null);
 
       setSelectedCandidateCid(candidate.cid);
+      pendingSmilesRef.current = candidate.smiles;
       setMobileInitialSmiles(candidate.smiles);
+      try {
+        setMobileMol(molFromSmiles(candidate.smiles));
+      } catch {}
 
       await ketcher.setMolecule(candidate.smiles);
       showStatus(
@@ -950,6 +1007,11 @@ export default function MolecularEditor() {
       setExportData(null);
 
       setAiApproved(true);
+      pendingSmilesRef.current = aiCandidate.smiles;
+      setMobileInitialSmiles(aiCandidate.smiles);
+      try {
+        setMobileMol(molFromSmiles(aiCandidate.smiles));
+      } catch {}
 
       await ketcher.setMolecule(aiCandidate.smiles);
       showStatus(`Approved & loaded AI structure for "${aiCandidate.proposedName}" onto Canvas!`);
@@ -1169,7 +1231,7 @@ export default function MolecularEditor() {
               {/* Identify Molecule (Primary action on canvas structure) */}
               <button
                 type="button"
-                onClick={handleIdentifyMolecule}
+                onClick={() => handleIdentifyMolecule()}
                 disabled={!isEditorReady || identifyLoading}
                 className="px-4 py-2.5 min-h-[44px] text-xs sm:text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-2 shadow-sm cursor-pointer"
                 title="Query PubChem PUG REST with current structure to identify compound"
@@ -1655,7 +1717,7 @@ export default function MolecularEditor() {
                     </button>
                     <button
                       type="button"
-                      onClick={handleIdentifyMolecule}
+                      onClick={() => handleIdentifyMolecule()}
                       className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-medium rounded-lg transition-colors cursor-pointer"
                     >
                       Retry Identification
@@ -2288,16 +2350,89 @@ export default function MolecularEditor() {
 
         {/* Ketcher Molecular Structure Editor Canvas */}
         <div id="ketcher-canvas-card" className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex flex-col relative">
-          {/* Ketcher Canvas Header Bar */}
-          <div className="bg-gray-100/80 px-4 py-2 border-b border-gray-200 flex items-center justify-between text-xs text-gray-600">
+          {/* Ketcher Canvas Header Bar with Integrated Action Controls */}
+          <div className="bg-slate-100/95 px-4 py-2 border-b border-gray-200 flex flex-wrap items-center justify-between gap-2 text-xs">
             <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block animate-pulse"></span>
-              <span className="font-semibold text-gray-700">Ketcher 2D Drawing Workspace</span>
-              <span className="text-gray-400">|</span>
-              <span>Draw atoms, bonds, and rings, then click Identify Molecule</span>
+              <span className={`w-2.5 h-2.5 rounded-full inline-block ${isEditorReady ? "bg-emerald-500 animate-pulse" : "bg-amber-400"}`}></span>
+              <span className="font-bold text-gray-800">Ketcher 2D Drawing Workspace</span>
+              <span className="text-gray-400 hidden sm:inline">|</span>
+              <span className="text-gray-500 hidden md:inline">Draw atoms, bonds & rings</span>
+              <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200 hidden sm:inline">
+                {isEditorReady ? "Ready" : "Initializing..."}
+              </span>
             </div>
-            <div className="text-gray-500 hidden sm:block">
-              {isEditorReady ? "Status: Ready" : "Status: Initializing..."}
+
+            {/* Quick Canvas Actions Bar */}
+            <div className="flex flex-wrap items-center gap-1.5 ml-auto">
+              <span className="text-[11px] font-semibold text-gray-500 px-1 hidden lg:inline">Samples:</span>
+              {SAMPLE_STRUCTURES.map((sample) => (
+                <button
+                  key={sample.name}
+                  type="button"
+                  onClick={() => handleLoadSample(sample.smiles, sample.name)}
+                  disabled={!isEditorReady}
+                  className="px-2 py-1 text-[11px] font-medium text-gray-700 bg-white hover:bg-blue-50 hover:text-blue-700 rounded border border-gray-300 disabled:opacity-50 transition-colors shadow-2xs cursor-pointer hidden md:inline-flex"
+                  title={`Load ${sample.name}`}
+                >
+                  {sample.name}
+                </button>
+              ))}
+
+              <div className="h-4 w-px bg-gray-300 mx-0.5 hidden md:block" />
+
+              {/* Clear Canvas */}
+              <button
+                type="button"
+                onClick={handleClearStructure}
+                disabled={!isEditorReady}
+                className="px-2 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-red-50 hover:text-red-700 hover:border-red-300 rounded border border-gray-300 disabled:opacity-50 transition-colors cursor-pointer"
+                title="Clear Ketcher canvas"
+              >
+                ✕ Clear
+              </button>
+
+              {/* Export Structure */}
+              <button
+                type="button"
+                onClick={handleExportStructure}
+                disabled={!isEditorReady || exportLoading}
+                className="px-2 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 hover:text-blue-700 rounded border border-gray-300 disabled:opacity-50 transition-colors cursor-pointer"
+                title="Export structure as SMILES and Molfile"
+              >
+                📤 Export
+              </button>
+
+              {/* Central AI: Ask ChemAI */}
+              <button
+                type="button"
+                onClick={() => handleOpenChat()}
+                className="px-2.5 py-1 text-xs font-semibold text-white bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 rounded-lg shadow-2xs transition-all flex items-center gap-1 cursor-pointer"
+                title="Open ChemAI Chat about this structure"
+              >
+                <ChemAINeuralHexIcon className="w-3.5 h-3.5 text-cyan-200" />
+                <span className="hidden sm:inline">Ask AI</span>
+              </button>
+
+              {/* Primary Action: Identify Molecule directly from canvas */}
+              <button
+                type="button"
+                onClick={() => handleIdentifyMolecule()}
+                disabled={!isEditorReady || identifyLoading}
+                className="px-3 py-1 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-lg disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                title="Identify current structure against PubChem"
+              >
+                {identifyLoading ? (
+                  <>
+                    <span className="animate-spin text-xs">⏳</span>
+                    <span>Identifying...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>🔬</span>
+                    <span>Identify Molecule</span>
+                  </>
+                )}
+              </button>
             </div>
           </div>
 
