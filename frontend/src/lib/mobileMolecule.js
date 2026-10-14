@@ -180,8 +180,24 @@ export function setBondOrder(mol, bondId, order) {
 export function setAtomElement(mol, atomId, el) {
   return {
     ...mol,
-    atoms: mol.atoms.map((a) => (a.id === atomId ? { ...a, el, charge: 0 } : a)),
+    atoms: mol.atoms.map((a) => (a.id === atomId ? { ...a, el } : a)),
   };
+}
+
+export function setAtomCharge(mol, atomId, charge) {
+  return {
+    ...mol,
+    atoms: mol.atoms.map((a) => (a.id === atomId ? { ...a, charge: Number(charge) || 0 } : a)),
+  };
+}
+
+export function cycleAtomCharge(mol, atomId, delta = 1) {
+  const atom = getAtom(mol, atomId);
+  if (!atom) return mol;
+  let nextCharge = (atom.charge || 0) + delta;
+  if (nextCharge > 2) nextCharge = -2;
+  if (nextCharge < -2) nextCharge = 2;
+  return setAtomCharge(mol, atomId, nextCharge);
 }
 
 export function removeAtom(mol, atomId) {
@@ -191,8 +207,21 @@ export function removeAtom(mol, atomId) {
   };
 }
 
+export function removeAtoms(mol, atomIds) {
+  const set = new Set(atomIds);
+  return {
+    atoms: mol.atoms.filter((a) => !set.has(a.id)),
+    bonds: mol.bonds.filter((b) => !set.has(b.a) && !set.has(b.b)),
+  };
+}
+
 export function removeBond(mol, bondId) {
   return { ...mol, bonds: mol.bonds.filter((b) => b.id !== bondId) };
+}
+
+export function removeBonds(mol, bondIds) {
+  const set = new Set(bondIds);
+  return { ...mol, bonds: mol.bonds.filter((b) => !set.has(b.id)) };
 }
 
 export function moveAtoms(mol, ids, dx, dy, baseMol = mol) {
@@ -201,6 +230,20 @@ export function moveAtoms(mol, ids, dx, dy, baseMol = mol) {
     ...mol,
     atoms: baseMol.atoms.map((a) => (set.has(a.id) ? { ...a, x: a.x + dx, y: a.y + dy } : a)),
   };
+}
+
+export function getConnectedComponent(mol, startAtomId) {
+  const visited = new Set();
+  const queue = [startAtomId];
+  while (queue.length > 0) {
+    const cur = queue.pop();
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    for (const nb of neighborIds(mol, cur)) {
+      if (!visited.has(nb)) queue.push(nb);
+    }
+  }
+  return Array.from(visited);
 }
 
 /* ------------------------------------------------------------------ */
@@ -535,3 +578,100 @@ export function sanitizeMol(raw) {
   reseedIds(mol);
   return mol;
 }
+
+/** Parse Molfile (V2000 or V3000) into editor molecule model with 2D coordinates. */
+export function molFromMolfile(molfile) {
+  if (!molfile || typeof molfile !== "string" || !molfile.trim()) {
+    return EMPTY_MOL;
+  }
+  const m = OCL.Molecule.fromMolfile(molfile);
+  const n = m.getAllAtoms();
+  const nb = m.getAllBonds();
+  if (!n) return EMPTY_MOL;
+
+  let total = 0;
+  for (let b = 0; b < nb; b++) {
+    const a1 = m.getBondAtom(0, b);
+    const a2 = m.getBondAtom(1, b);
+    total += Math.hypot(m.getAtomX(a1) - m.getAtomX(a2), m.getAtomY(a1) - m.getAtomY(a2));
+  }
+  const avg = nb ? total / nb : 1;
+  const scale = avg > 0 ? BOND_LEN / avg : 1;
+
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0; i < n; i++) {
+    cx += m.getAtomX(i);
+    cy += m.getAtomY(i);
+  }
+  cx /= n;
+  cy /= n;
+
+  const ids = [];
+  const atoms = [];
+  for (let i = 0; i < n; i++) {
+    const id = nextId();
+    ids.push(id);
+    atoms.push({
+      id,
+      x: (m.getAtomX(i) - cx) * scale,
+      y: (m.getAtomY(i) - cy) * scale,
+      el: m.getAtomLabel(i) || "C",
+      charge: m.getAtomCharge(i) || 0,
+    });
+  }
+  const bonds = [];
+  for (let b = 0; b < nb; b++) {
+    const order = Math.min(3, Math.max(1, m.getBondOrder(b)));
+    bonds.push({
+      id: nextId(),
+      a: ids[m.getBondAtom(0, b)],
+      b: ids[m.getBondAtom(1, b)],
+      order,
+    });
+  }
+  return { atoms, bonds };
+}
+
+/** Recompute clean 2D layout coordinates for a molecule using OpenChemLib. */
+export function cleanStructure(mol) {
+  if (!mol || !mol.atoms || !mol.atoms.length) return mol;
+  try {
+    const ocl = toOCL(mol);
+    const smiles = ocl.toSmiles();
+    if (smiles) {
+      return molFromSmiles(smiles);
+    }
+  } catch (err) {
+    console.warn("Could not clean structure layout:", err);
+  }
+  return mol;
+}
+
+/** Validate structure using OpenChemLib. Returns { valid, error, formula, weight, smiles }. */
+export function validateStructure(mol) {
+  if (!mol || !mol.atoms || mol.atoms.length === 0) {
+    return { valid: false, error: "Canvas is empty. Draw a chemical structure first.", atomCount: 0, bondCount: 0 };
+  }
+  try {
+    const ocl = toOCL(mol);
+    const smiles = ocl.toSmiles();
+    const mf = ocl.getMolecularFormula();
+    return {
+      valid: true,
+      smiles,
+      formula: mf.formula,
+      weight: Number(mf.relativeWeight || mf.absoluteWeight).toFixed(2),
+      atomCount: mol.atoms.length,
+      bondCount: mol.bonds.length,
+    };
+  } catch (err) {
+    return {
+      valid: false,
+      error: err?.message || "Invalid chemical structure",
+      atomCount: mol.atoms?.length || 0,
+      bondCount: mol.bonds?.length || 0,
+    };
+  }
+}
+

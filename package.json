@@ -2,7 +2,7 @@
   "name": "chemai-workspace",
   "version": "1.0.0",
   "private": true,
-  "description": "ChemAI - AI Chemistry Assistant with Ketcher & PubChem integration",
+  "description": "ChemAI - AI Chemistry Assistant with PubChem integration & custom molecular editor",
   "scripts": {
     "dev:frontend": "npm run dev --prefix frontend",
     "dev:backend": "npm run dev --prefix backend",

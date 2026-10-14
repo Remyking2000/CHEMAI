@@ -10,9 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "ketcher-core": "^3.7.0",
-    "ketcher-react": "^3.7.0",
-    "ketcher-standalone": "^3.10.0-build.1",
     "openchemlib": "^9.11.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

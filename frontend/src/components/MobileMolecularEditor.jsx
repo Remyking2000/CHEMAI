@@ -1,5 +1,4 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import PropTypes from "prop-types";
 import {
   BOND_LEN,
   EMPTY_MOL,
@@ -37,6 +36,13 @@ import { ChemAINeuralHexIcon } from "./ChemAIIcons";
  * rock-solid gesture disambiguation, and verified chemical correctness.
  */
 export default function MobileMolecularEditor({
+  mol: externalMol,
+  onMolChange,
+  undo: externalUndo,
+  redo: externalRedo,
+  canUndo: externalCanUndo,
+  canRedo: externalCanRedo,
+  clear: externalClear,
   initialMol = null,
   initialSmiles = null,
   onIdentify,
@@ -48,9 +54,9 @@ export default function MobileMolecularEditor({
   className = "",
 }) {
   // ---------------------------------------------------------------------------
-  // Molecule & History State
+  // Molecule & History State (Supports both controlled and standalone modes)
   // ---------------------------------------------------------------------------
-  const [mol, setMol] = useState(() => {
+  const [internalMol, setInternalMol] = useState(() => {
     if (initialMol && Array.isArray(initialMol.atoms) && initialMol.atoms.length > 0) {
       return initialMol;
     }
@@ -69,75 +75,99 @@ export default function MobileMolecularEditor({
     }
   });
 
+  const [internalHistory, setInternalHistory] = useState({ past: [], future: [] });
+
+  const isControlled = externalMol !== undefined && onMolChange !== undefined;
+  const mol = isControlled ? externalMol : internalMol;
+
   const molRef = useRef(mol);
   molRef.current = mol;
 
-  const [history, setHistory] = useState({ past: [], future: [] });
-
   const pushState = useCallback(
     (newMol) => {
-      setMol((current) => {
-        if (current === newMol) return current;
-        setHistory((h) => ({
-          past: [...h.past.slice(-25), current],
-          future: [],
-        }));
-        if (onStructureChange) {
-          try {
-            onStructureChange(newMol);
-          } catch (err) {
-            console.error("onStructureChange error:", err);
-          }
+      if (isControlled) {
+        onMolChange(newMol);
+      } else {
+        setInternalMol((current) => {
+          if (current === newMol) return current;
+          setInternalHistory((h) => ({
+            past: [...h.past.slice(-25), current],
+            future: [],
+          }));
+          return newMol;
+        });
+      }
+      if (onStructureChange) {
+        try {
+          onStructureChange(newMol);
+        } catch (err) {
+          console.error("onStructureChange error:", err);
         }
-        return newMol;
-      });
+      }
     },
-    [onStructureChange]
+    [isControlled, onMolChange, onStructureChange]
   );
 
   const handleUndo = useCallback(() => {
-    setHistory((h) => {
-      if (h.past.length === 0) return h;
-      const previous = h.past[h.past.length - 1];
-      const newPast = h.past.slice(0, -1);
-      setMol(previous);
-      if (onStructureChange) onStructureChange(previous);
-      return { past: newPast, future: [mol, ...h.future] };
-    });
-  }, [mol, onStructureChange]);
+    if (isControlled && externalUndo) {
+      externalUndo();
+    } else {
+      setInternalHistory((h) => {
+        if (h.past.length === 0) return h;
+        const previous = h.past[h.past.length - 1];
+        const newPast = h.past.slice(0, -1);
+        setInternalMol(previous);
+        return { past: newPast, future: [mol, ...h.future] };
+      });
+    }
+    if (onStructureChange) onStructureChange(mol);
+  }, [isControlled, externalUndo, mol, onStructureChange]);
 
   const handleRedo = useCallback(() => {
-    setHistory((h) => {
-      if (h.future.length === 0) return h;
-      const next = h.future[0];
-      const newFuture = h.future.slice(1);
-      setMol(next);
-      if (onStructureChange) onStructureChange(next);
-      return { past: [...h.past, mol], future: newFuture };
-    });
-  }, [mol, onStructureChange]);
+    if (isControlled && externalRedo) {
+      externalRedo();
+    } else {
+      setInternalHistory((h) => {
+        if (h.future.length === 0) return h;
+        const next = h.future[0];
+        const newFuture = h.future.slice(1);
+        setInternalMol(next);
+        return { past: [...h.past, mol], future: newFuture };
+      });
+    }
+    if (onStructureChange) onStructureChange(mol);
+  }, [isControlled, externalRedo, mol, onStructureChange]);
+
+  const history = isControlled
+    ? {
+        past: externalCanUndo ? [1] : [],
+        future: externalCanRedo ? [1] : [],
+      }
+    : internalHistory;
 
   // Synchronize when initialSmiles or initialMol changes externally
   useEffect(() => {
+    if (isControlled) return;
     if (initialSmiles === "") {
-      setMol(EMPTY_MOL);
-      setHistory({ past: [], future: [] });
+      setInternalMol(EMPTY_MOL);
+      setInternalHistory({ past: [], future: [] });
     } else if (initialSmiles && typeof initialSmiles === "string" && initialSmiles.trim()) {
       try {
         const loaded = molFromSmiles(initialSmiles.trim());
-        setMol(loaded);
-        setHistory({ past: [], future: [] });
+        setInternalMol(loaded);
+        setInternalHistory({ past: [], future: [] });
       } catch (err) {
         console.warn("Could not load external initialSmiles:", err);
       }
     }
-  }, [initialSmiles]);
+  }, [isControlled, initialSmiles]);
 
   useEffect(() => {
+    if (isControlled) return;
     if (initialMol) {
-      setMol(initialMol);
+      setInternalMol(initialMol);
     }
-  }, [initialMol]);
+  }, [isControlled, initialMol]);
 
   // ---------------------------------------------------------------------------
   // Tool Selection & Configuration
@@ -756,6 +786,8 @@ export default function MobileMolecularEditor({
 
   return (
     <div
+      id="mobile-canvas-card"
+      aria-label="Mobile-first molecular editor"
       className={`flex flex-col h-full w-full bg-slate-50 text-slate-900 select-none overflow-hidden relative font-sans ${className}`}
     >
       {/* ------------------------------------------------------------------ */}
@@ -830,7 +862,7 @@ export default function MobileMolecularEditor({
               type="button"
               onClick={onSwitchToDesktop}
               className="ml-1 px-2.5 py-1.5 min-h-[36px] text-xs font-semibold rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 flex items-center gap-1 transition-colors"
-              title="Switch to Desktop Ketcher"
+              title="Switch to Desktop Editor"
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
@@ -1670,17 +1702,3 @@ export default function MobileMolecularEditor({
   );
 }
 
-MobileMolecularEditor.propTypes = {
-  initialMol: PropTypes.shape({
-    atoms: PropTypes.arrayOf(PropTypes.object),
-    bonds: PropTypes.arrayOf(PropTypes.object),
-  }),
-  initialSmiles: PropTypes.string,
-  onIdentify: PropTypes.func,
-  identifyLoading: PropTypes.bool,
-  onOpenChat: PropTypes.func,
-  onSwitchToDesktop: PropTypes.func,
-  onSearchCandidate: PropTypes.func,
-  onStructureChange: PropTypes.func,
-  className: PropTypes.string,
-};

@@ -18,9 +18,7 @@ chemAI/
 │   │   ├── App.jsx               # Route configuration
 │   │   ├── index.css             # Tailwind CSS styles
 │   │   └── main.jsx              # Application entry point
-│   ├── index.html                # HTML entry template
-│   ├── vite.config.js            # Vite configuration with Tailwind & Ketcher proxy
-│   ├── eslint.config.js          # ESLint rules
+│   ├── vite.config.js            # Vite configuration with Tailwind CSS & proxy
 │   └── package.json              # Frontend scripts and dependencies
 │
 ├── backend/                      # Node.js + Express REST API
@@ -118,8 +116,7 @@ npm run dev
 ### Frontend
 - **Framework**: [React 18](https://react.dev/) + [Vite](https://vitejs.dev/)
 - **Routing**: [React Router DOM v7](https://reactrouter.com/)
-- **Styling**: [Tailwind CSS v4](https://tailwindcss.com/)
-- **Chemistry**: Ketcher React & OpenChemLib
+- **Chemistry**: ChemAI Shared Molecular Engine & OpenChemLib
 
 ### Backend
 - **Runtime**: [Node.js](https://nodejs.org/) (ES Modules)

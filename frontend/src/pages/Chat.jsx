@@ -588,7 +588,7 @@ export default function Chat() {
               to="/editor"
               state={selectedCompound ? { loadSmiles: selectedCompound.smiles, compound: selectedCompound } : null}
               className="inline-flex items-center gap-1.5 px-3 py-2 min-h-[44px] rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-xs sm:text-sm font-semibold text-cyan-300 border border-slate-700/80 hover:border-cyan-500/40 transition-colors shadow-2xs shrink-0 cursor-pointer"
-              title="Return to Ketcher Molecular Editor"
+              title="Return to Molecular Editor"
             >
               <span className="text-base font-bold">←</span>
               <span className="hidden sm:inline">Return to</span>
