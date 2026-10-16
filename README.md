@@ -111,6 +111,26 @@ npm run dev
 
 ---
 
+### 4. Continuous Deployment to Cloudflare Pages ☁️
+
+ChemAI is configured for continuous deployment on **Cloudflare Pages** with serverless edge functions (`functions/api/[[route]].js`):
+
+- **Auto-deploy on push**: Any push to the `main` branch automatically builds and deploys both the React frontend and edge API functions.
+- **Root Directory**: `/`
+- **Build Command**: `npm run build` (or `npm run cf:pages:build`)
+- **Build Output Directory**: `frontend/dist`
+- **Edge Functions**: Cloudflare Pages automatically discovers and mounts `functions/api/[[route]].js` under `/api/*`.
+
+To connect your GitHub repository in the Cloudflare Dashboard:
+1. Log in to [Cloudflare Dashboard](https://dash.cloudflare.com) → **Workers & Pages**.
+2. Select **Create application** → **Pages** → **Connect to Git**.
+3. Choose the `Remyking2000/CHEMAI` repository and select the `main` branch.
+4. Set Build command to `npm run build` and Build output directory to `frontend/dist`.
+5. Under **Environment variables**, set `AI_PROVIDER` (e.g. `openrouter`) and `OPENROUTER_API_KEY` (or `GEMINI_API_KEY`).
+6. Click **Save and Deploy**. Any subsequent `git push origin main` will rebuild and update everything automatically.
+
+---
+
 ## 🛠️ Tech Stack
 
 ### Frontend
