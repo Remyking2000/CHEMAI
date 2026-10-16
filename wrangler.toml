@@ -1,10 +1,15 @@
 # ==============================================================================
-# ChemAI Cloudflare Pages Configuration
+# ChemAI Cloudflare Deployment Configuration
+# Compatible with both Cloudflare Workers (with Assets) and Cloudflare Pages
 # ==============================================================================
 name = "chemai"
+main = "worker.js"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
-pages_build_output_dir = "frontend/dist"
+
+[assets]
+directory = "frontend/dist"
+not_found_handling = "single-page-application"
 
 # Default environment variables (non-secret)
 [vars]
