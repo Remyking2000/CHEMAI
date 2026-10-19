@@ -16,6 +16,6 @@
   "vars": {
     "AI_PROVIDER": "openrouter",
     "GEMINI_MODEL": "gemini-2.5-flash",
-    "OPENROUTER_MODEL": "openrouter/free"
+    "OPENROUTER_MODEL": "liquid/lfm-2.5-2.6b:free"
   }
 }

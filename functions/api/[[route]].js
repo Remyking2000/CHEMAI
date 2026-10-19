@@ -877,7 +877,7 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
         return {
           text: replyText.trim(),
           provider: "openrouter",
-          model: env.OPENROUTER_MODEL || "openrouter/free",
+          model: env.OPENROUTER_MODEL || "liquid/lfm-2.5-2.6b:free",
         };
       }
     }
@@ -890,7 +890,7 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
   return {
     text: dynamicReply,
     provider: "chemai-assistant",
-    model: env.OPENROUTER_MODEL || "openrouter/free",
+    model: env.OPENROUTER_MODEL || "liquid/lfm-2.5-2.6b:free",
   };
 }
 
