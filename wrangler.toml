@@ -11,11 +11,14 @@ compatibility_flags = ["nodejs_compat"]
 directory = "frontend/dist"
 not_found_handling = "single-page-application"
 
+[ai]
+binding = "AI"
+
 # Default environment variables (non-secret)
 [vars]
 AI_PROVIDER = "openrouter"
 GEMINI_MODEL = "gemini-2.5-flash"
-OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free"
+OPENROUTER_MODEL = "openrouter/free"
 
 # ==============================================================================
 # Cloudflare D1 SQL Database Binding
