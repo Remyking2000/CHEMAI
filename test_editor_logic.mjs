@@ -11,6 +11,8 @@ import {
   valenceMap,
   isOvervalent,
   implicitHydrogens,
+  molFromSmiles,
+  computeViewportTransform,
 } from "./frontend/src/lib/mobileMolecule.js";
 
 function assert(condition, message) {
@@ -132,5 +134,23 @@ for (let i = 0; i < 5; i++) {
 const vMap = valenceMap(mVal);
 assert(vMap.get(cId) === 5, "Carbon has valence 5 with 5 single bonds");
 assert(isOvervalent(mVal.atoms[0], vMap.get(cId)) === true, "isOvervalent correctly flags 5-valent carbon");
+
+// Test 6: Bounding-box centering in molFromSmiles and computeViewportTransform across desktop viewports
+const aspirinMol = molFromSmiles("CC(=O)Oc1ccccc1C(=O)O");
+const viewports = [
+  { w: 910, h: 500, label: "1024x768 canvas" },
+  { w: 1170, h: 500, label: "1366x768 canvas" },
+  { w: 1200, h: 560, label: "1920x1080 canvas" },
+];
+for (const vp of viewports) {
+  const tf = computeViewportTransform(aspirinMol, vp.w, vp.h);
+  assert(tf.zoom >= 1.2 && tf.zoom <= 2.0, `Aspirin zoom on ${vp.label} is readable (${tf.zoom})`);
+  const screenCenterX = vp.w / 2 + tf.pan.x + tf.centerX * tf.zoom;
+  const screenCenterY = vp.h / 2 + tf.pan.y + tf.centerY * tf.zoom;
+  assert(
+    Math.abs(screenCenterX - vp.w / 2) < 1 && Math.abs(screenCenterY - vp.h / 2) < 1,
+    `Aspirin center maps to exact canvas midpoint on ${vp.label}`
+  );
+}
 
 console.log("--- All Coordinate and Editor Logic Tests Passed! ---");

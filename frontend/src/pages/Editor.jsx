@@ -1,17 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Link, useNavigate, useLocation } from "react-router-dom";
 import OCL from "openchemlib";
 import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
 import DesktopMolecularEditor from "../components/DesktopMolecularEditor";
 import MobileMolecularEditor from "../components/MobileMolecularEditor";
 import { useMoleculeManager } from "../lib/useMoleculeManager";
-import {
-  exportStructure,
-  molFromSmiles,
-  molFromMolfile,
-  EMPTY_MOL,
-  cleanStructure,
-} from "../lib/moleculeEngine";
 import { API_ROUTES } from "../config/api";
 
 // Quick example templates to test and draw
@@ -42,7 +35,6 @@ export default function MolecularEditor() {
 
   // Phase 2 Explanation state setters (preserved for reset cascades)
   const [, setExplainResult] = useState(null);
-  const [, setExplainLoading] = useState(false);
   const [, setExplainError] = useState(null);
 
   // Phase 3A: Reverse Structure Lookup (Build Structure) state
@@ -113,10 +105,12 @@ export default function MolecularEditor() {
     showStatus("Switched to Desktop Molecular Editor view.");
   };
 
+  const { loadSmiles: loadSmilesToManager } = moleculeManager;
+
   // Restore structure from navigation state (e.g. returning from Chat)
   useEffect(() => {
     if (location.state?.loadSmiles) {
-      moleculeManager.loadSmiles(location.state.loadSmiles);
+      loadSmilesToManager(location.state.loadSmiles);
       if (location.state?.compound) {
         const c = location.state.compound;
         setIdentifyResult({
@@ -133,7 +127,7 @@ export default function MolecularEditor() {
         });
       }
     }
-  }, [location.state]);
+  }, [location.state, loadSmilesToManager]);
 
   // Helper to extract current structure from shared engine
   const getCurrentStructure = async () => {
@@ -2154,6 +2148,7 @@ export default function MolecularEditor() {
             canUndo={moleculeManager.canUndo}
             canRedo={moleculeManager.canRedo}
             clear={handleClearStructure}
+            loadVersion={moleculeManager.loadVersion}
             onIdentify={handleIdentifyMolecule}
             identifyLoading={identifyLoading}
             onOpenChat={() => handleOpenChat()}

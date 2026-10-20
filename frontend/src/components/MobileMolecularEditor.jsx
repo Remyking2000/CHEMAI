@@ -506,7 +506,11 @@ export default function MobileMolecularEditor({
             : a
         ),
       };
-      setMol(updated);
+      if (isControlled) {
+        onMolChange(updated);
+      } else {
+        setInternalMol(updated);
+      }
       return;
     }
 
@@ -541,10 +545,12 @@ export default function MobileMolecularEditor({
     // 1. Finished moving an atom (commit one clean history entry)
     if (g.dragType === "move_atom" && g.startAtom && g.dragStarted) {
       if (g.molBeforeDrag) {
-        setHistory((h) => ({
-          past: [...h.past.slice(-25), g.molBeforeDrag],
-          future: [],
-        }));
+        if (!isControlled) {
+          setInternalHistory((h) => ({
+            past: [...h.past.slice(-25), g.molBeforeDrag],
+            future: [],
+          }));
+        }
         if (onStructureChange) {
           try {
             onStructureChange(molRef.current);
@@ -654,7 +660,11 @@ export default function MobileMolecularEditor({
     }
     // Revert atom position if an interrupted drag occurred
     if (g.dragType === "move_atom" && g.molBeforeDrag) {
-      setMol(g.molBeforeDrag);
+      if (isControlled) {
+        onMolChange(g.molBeforeDrag);
+      } else {
+        setInternalMol(g.molBeforeDrag);
+      }
     }
     setDragPreview(null);
     if (g.pointers.size === 0) {
@@ -670,7 +680,11 @@ export default function MobileMolecularEditor({
   // Action Handlers
   // ---------------------------------------------------------------------------
   const handleClearCanvas = () => {
-    pushState(EMPTY_MOL);
+    if (isControlled && externalClear) {
+      externalClear();
+    } else {
+      pushState(EMPTY_MOL);
+    }
     setSelectedAtomId(null);
     setSelectedBondId(null);
     setShowClearConfirm(false);

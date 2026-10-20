@@ -536,14 +536,20 @@ export function molFromSmiles(smiles) {
   const avg = nb ? total / nb : 1;
   const scale = BOND_LEN / (avg || 1);
 
-  let cx = 0;
-  let cy = 0;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
   for (let i = 0; i < n; i++) {
-    cx += m.getAtomX(i);
-    cy += m.getAtomY(i);
+    const x = m.getAtomX(i);
+    const y = m.getAtomY(i);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
   }
-  cx /= n;
-  cy /= n;
+  const cx = Number.isFinite(minX) && Number.isFinite(maxX) ? (minX + maxX) / 2 : 0;
+  const cy = Number.isFinite(minY) && Number.isFinite(maxY) ? (minY + maxY) / 2 : 0;
 
   const ids = [];
   const atoms = [];
@@ -595,17 +601,31 @@ export function molFromMolfile(molfile) {
     const a2 = m.getBondAtom(1, b);
     total += Math.hypot(m.getAtomX(a1) - m.getAtomX(a2), m.getAtomY(a1) - m.getAtomY(a2));
   }
+  if (nb > 0 && total < 1e-4 && typeof m.inventCoordinates === "function") {
+    m.inventCoordinates();
+    for (let b = 0; b < nb; b++) {
+      const a1 = m.getBondAtom(0, b);
+      const a2 = m.getBondAtom(1, b);
+      total += Math.hypot(m.getAtomX(a1) - m.getAtomX(a2), m.getAtomY(a1) - m.getAtomY(a2));
+    }
+  }
   const avg = nb ? total / nb : 1;
   const scale = avg > 0 ? BOND_LEN / avg : 1;
 
-  let cx = 0;
-  let cy = 0;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
   for (let i = 0; i < n; i++) {
-    cx += m.getAtomX(i);
-    cy += m.getAtomY(i);
+    const x = m.getAtomX(i);
+    const y = m.getAtomY(i);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
   }
-  cx /= n;
-  cy /= n;
+  const cx = Number.isFinite(minX) && Number.isFinite(maxX) ? (minX + maxX) / 2 : 0;
+  const cy = Number.isFinite(minY) && Number.isFinite(maxY) ? (minY + maxY) / 2 : 0;
 
   const ids = [];
   const atoms = [];
@@ -674,4 +694,72 @@ export function validateStructure(mol) {
     };
   }
 }
+
+/**
+ * Compute optimal centered viewport transform (zoom and pan) for a molecule
+ * within a visible canvas of (width x height).
+ */
+export function computeViewportTransform(mol, width, height, options = {}) {
+  const safeW = Math.max(200, Number(width) || 800);
+  const safeH = Math.max(200, Number(height) || 500);
+  const emptyZoom = options.emptyZoom ?? 1.5;
+
+  if (!mol || !Array.isArray(mol.atoms) || mol.atoms.length === 0) {
+    return {
+      zoom: emptyZoom,
+      pan: { x: 0, y: 0 },
+      centerX: 0,
+      centerY: 0,
+      spanW: 0,
+      spanH: 0,
+    };
+  }
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+
+  for (const a of mol.atoms) {
+    if (a.x < minX) minX = a.x;
+    if (a.x > maxX) maxX = a.x;
+    if (a.y < minY) minY = a.y;
+    if (a.y > maxY) maxY = a.y;
+  }
+
+  const rawW = Math.max(0, maxX - minX);
+  const rawH = Math.max(0, maxY - minY);
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+
+  // Include padding in world units for atom labels, hydrogens, and selection halos,
+  // with a minimum span so 1-3 atom molecules are not over-magnified.
+  const effectiveW = Math.max(rawW + BOND_LEN * 2.2, BOND_LEN * 3.5);
+  const effectiveH = Math.max(rawH + BOND_LEN * 2.2, BOND_LEN * 3.5);
+
+  const padX = Math.max(56, safeW * 0.12);
+  const padY = Math.max(48, safeH * 0.12);
+  const availW = Math.max(120, safeW - padX * 2);
+  const availH = Math.max(120, safeH - padY * 2);
+
+  const idealScale = Math.min(availW / effectiveW, availH / effectiveH);
+  const minZoom = options.minZoom ?? 0.25;
+  const maxZoom = options.maxZoom ?? 2.0;
+  const zoom = +Math.max(minZoom, Math.min(idealScale, maxZoom)).toFixed(2);
+
+  const pan = {
+    x: +(-centerX * zoom).toFixed(2),
+    y: +(-centerY * zoom).toFixed(2),
+  };
+
+  return {
+    zoom,
+    pan,
+    centerX,
+    centerY,
+    spanW: rawW,
+    spanH: rawH,
+  };
+}
+
 

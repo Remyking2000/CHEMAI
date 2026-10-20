@@ -38,6 +38,7 @@ export function useMoleculeManager(initialMol = null, initialSmiles = null) {
   molRef.current = mol;
 
   const [history, setHistory] = useState({ past: [], future: [] });
+  const [loadVersion, setLoadVersion] = useState(0);
 
   const pushState = useCallback((newMol) => {
     setMol((current) => {
@@ -72,24 +73,29 @@ export function useMoleculeManager(initialMol = null, initialSmiles = null) {
 
   const clear = useCallback(() => {
     pushState(EMPTY_MOL);
+    setLoadVersion((v) => v + 1);
   }, [pushState]);
 
   const loadSmiles = useCallback((smiles) => {
     if (!smiles || !smiles.trim()) {
       pushState(EMPTY_MOL);
+      setLoadVersion((v) => v + 1);
       return;
     }
     const newM = molFromSmiles(smiles.trim());
     pushState(newM);
+    setLoadVersion((v) => v + 1);
   }, [pushState]);
 
   const loadMolfile = useCallback((molfile) => {
     if (!molfile || !molfile.trim()) {
       pushState(EMPTY_MOL);
+      setLoadVersion((v) => v + 1);
       return;
     }
     const newM = molFromMolfile(molfile.trim());
     pushState(newM);
+    setLoadVersion((v) => v + 1);
   }, [pushState]);
 
   const exportCurrent = useCallback(() => {
@@ -114,6 +120,7 @@ export function useMoleculeManager(initialMol = null, initialSmiles = null) {
     setMol,
     molRef,
     history,
+    loadVersion,
     canUndo: history.past.length > 0,
     canRedo: history.future.length > 0,
     pushState,

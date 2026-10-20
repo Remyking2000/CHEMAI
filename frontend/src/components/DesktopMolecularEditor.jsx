@@ -6,7 +6,6 @@ import {
   ALL_ELEMENTS,
   ELEMENT_COLORS,
   getAtom,
-  getBond,
   findAtomNear,
   findBondNear,
   addAtom,
@@ -17,23 +16,25 @@ import {
   removeBond,
   removeAtoms,
   removeBonds,
-  setAtomCharge,
   cycleAtomCharge,
   addSubstituent,
   drawBondTo,
   previewBondEnd,
   placeRing,
-  toOCL,
   exportStructure,
   molFromSmiles,
   molFromMolfile,
   cleanStructure,
-  validateStructure,
   valenceMap,
   implicitHydrogens,
   isOvervalent,
   getConnectedComponent,
+  computeViewportTransform,
 } from "../lib/moleculeEngine";
+
+const ZOOM_PRESETS = [50, 75, 80, 100, 120, 150, 200, 250, 300];
+const MIN_ZOOM = 0.25;
+const MAX_ZOOM = 4.0;
 
 /**
  * DesktopMolecularEditor
@@ -50,6 +51,7 @@ export default function DesktopMolecularEditor({
   canUndo: externalCanUndo,
   canRedo: externalCanRedo,
   clear: externalClear,
+  loadVersion = 0,
   initialMol = null,
   initialSmiles = null,
   onIdentify,
@@ -84,9 +86,17 @@ export default function DesktopMolecularEditor({
 
   const isControlled = externalMol !== undefined && onMolChange !== undefined;
   const currentMol = isControlled ? externalMol : internalMol;
+  const currentMolRef = useRef(currentMol);
+  currentMolRef.current = currentMol;
+
+  // Track internal interactive edits vs external structure loads
+  const isInternalEditRef = useRef(false);
+  const hasUserAdjustedViewportRef = useRef(false);
+  const hasInitialFitRef = useRef(false);
 
   const pushState = useCallback(
-    (newMol) => {
+    (newMol, isInternal = true) => {
+      isInternalEditRef.current = isInternal;
       if (isControlled) {
         onMolChange(newMol);
       } else {
@@ -104,6 +114,7 @@ export default function DesktopMolecularEditor({
   );
 
   const handleUndo = useCallback(() => {
+    isInternalEditRef.current = true;
     if (isControlled && externalUndo) {
       externalUndo();
     } else {
@@ -120,6 +131,7 @@ export default function DesktopMolecularEditor({
   }, [isControlled, externalUndo, internalMol]);
 
   const handleRedo = useCallback(() => {
+    isInternalEditRef.current = true;
     if (isControlled && externalRedo) {
       externalRedo();
     } else {
@@ -137,14 +149,6 @@ export default function DesktopMolecularEditor({
 
   const canUndo = isControlled ? !!externalCanUndo : internalHistory.past.length > 0;
   const canRedo = isControlled ? !!externalCanRedo : internalHistory.future.length > 0;
-
-  const handleClear = useCallback(() => {
-    if (isControlled && externalClear) {
-      externalClear();
-    } else {
-      pushState(EMPTY_MOL);
-    }
-  }, [isControlled, externalClear, pushState]);
 
   // ---------------------------------------------------------------------------
   // 2. Editor Tools & Configuration State
@@ -166,10 +170,21 @@ export default function DesktopMolecularEditor({
   const [showPeriodicTable, setShowPeriodicTable] = useState(false);
   const [periodicFilter, setPeriodicFilter] = useState("");
 
+  // Import Structure modal state
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importError, setImportError] = useState(null);
+
   // Canvas Viewport Transformation
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [zoom, setZoom] = useState(1);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const [zoom, setZoom] = useState(1.5);
+  const [dimensions, setDimensions] = useState({ width: 900, height: 520 });
+  const dimensionsRef = useRef(dimensions);
+  dimensionsRef.current = dimensions;
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const panRef = useRef(pan);
+  panRef.current = pan;
 
   // Mouse interaction state
   const isMouseDownRef = useRef(false);
@@ -193,26 +208,79 @@ export default function DesktopMolecularEditor({
 
   // DOM Refs
   const containerRef = useRef(null);
+  const canvasContainerRef = useRef(null);
   const svgRef = useRef(null);
   const worldGroupRef = useRef(null);
 
   // ---------------------------------------------------------------------------
-  // 3. Responsive Resize Handling
+  // 3. Viewport Centering, Scaling & Responsive Resize Handling
   // ---------------------------------------------------------------------------
+  const fitMoleculeToViewport = useCallback((targetMol, targetDims = dimensionsRef.current) => {
+    const { zoom: nextZoom, pan: nextPan } = computeViewportTransform(
+      targetMol,
+      targetDims.width,
+      targetDims.height,
+      { minZoom: MIN_ZOOM, maxZoom: 2.0, emptyZoom: 1.5 }
+    );
+    setZoom(nextZoom);
+    setPan(nextPan);
+    zoomRef.current = nextZoom;
+    panRef.current = nextPan;
+  }, []);
+
+  const isMoleculeClipped = useCallback((mol, dims, curZoom, curPan) => {
+    if (!mol || !mol.atoms || mol.atoms.length === 0) return false;
+    const margin = 36;
+    for (const a of mol.atoms) {
+      const sx = dims.width / 2 + curPan.x + a.x * curZoom;
+      const sy = dims.height / 2 + curPan.y + a.y * curZoom;
+      if (
+        sx < margin ||
+        sx > dims.width - margin ||
+        sy < margin ||
+        sy > dims.height - margin
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+
   useEffect(() => {
     const updateSize = () => {
-      if (containerRef.current) {
-        const rect = containerRef.current.getBoundingClientRect();
-        setDimensions({
-          width: Math.max(rect.width, 400),
-          height: Math.max(rect.height, 500),
+      const el = canvasContainerRef.current || svgRef.current || containerRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const nextDims = {
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+        setDimensions((prev) => {
+          if (prev.width === nextDims.width && prev.height === nextDims.height && hasInitialFitRef.current) {
+            return prev;
+          }
+          dimensionsRef.current = nextDims;
+          if (
+            !hasInitialFitRef.current ||
+            !hasUserAdjustedViewportRef.current ||
+            isMoleculeClipped(currentMolRef.current, nextDims, zoomRef.current, panRef.current)
+          ) {
+            hasInitialFitRef.current = true;
+            fitMoleculeToViewport(currentMolRef.current, nextDims);
+          }
+          return nextDims;
         });
       }
     };
 
     updateSize();
     const observer = new ResizeObserver(updateSize);
-    if (containerRef.current) observer.observe(containerRef.current);
+    if (canvasContainerRef.current) {
+      observer.observe(canvasContainerRef.current);
+    } else if (containerRef.current) {
+      observer.observe(containerRef.current);
+    }
     window.addEventListener("resize", updateSize);
 
     return () => {
@@ -220,7 +288,31 @@ export default function DesktopMolecularEditor({
       window.removeEventListener("resize", updateSize);
       if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
     };
-  }, []);
+  }, [fitMoleculeToViewport, isMoleculeClipped]);
+
+  // Automatically center and scale when a structure is loaded or replaced externally
+  useEffect(() => {
+    if (isInternalEditRef.current) {
+      isInternalEditRef.current = false;
+      return;
+    }
+    hasUserAdjustedViewportRef.current = false;
+    setSelectedAtomIds(new Set());
+    setSelectedBondIds(new Set());
+    fitMoleculeToViewport(currentMol, dimensionsRef.current);
+  }, [currentMol, loadVersion, fitMoleculeToViewport]);
+
+  const handleClear = useCallback(() => {
+    hasUserAdjustedViewportRef.current = false;
+    setSelectedAtomIds(new Set());
+    setSelectedBondIds(new Set());
+    if (isControlled && externalClear) {
+      externalClear();
+    } else {
+      pushState(EMPTY_MOL, false);
+    }
+    fitMoleculeToViewport(EMPTY_MOL, dimensionsRef.current);
+  }, [isControlled, externalClear, pushState, fitMoleculeToViewport]);
 
   // ---------------------------------------------------------------------------
   // 4. Chemical Derivations (Valence, Overvalence, Formula)
@@ -255,97 +347,148 @@ export default function DesktopMolecularEditor({
   // 5. Coordinate Transformations (Screen <-> World)
   // ---------------------------------------------------------------------------
   const screenToWorld = useCallback(
-    (screenX, screenY) => {
+    (clientX, clientY) => {
       if (!svgRef.current) return { x: 0, y: 0 };
+
+      // Priority 1: Exact SVG transformation matrix inversion
+      if (worldGroupRef.current && typeof worldGroupRef.current.getScreenCTM === "function") {
+        try {
+          const ctm = worldGroupRef.current.getScreenCTM();
+          if (ctm) {
+            const inv = ctm.inverse();
+            if (typeof DOMPoint !== "undefined") {
+              const pt = new DOMPoint(clientX, clientY).matrixTransform(inv);
+              if (Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+                return { x: pt.x, y: pt.y };
+              }
+            } else if (typeof svgRef.current.createSVGPoint === "function") {
+              const pt = svgRef.current.createSVGPoint();
+              pt.x = clientX;
+              pt.y = clientY;
+              const res = pt.matrixTransform(inv);
+              if (Number.isFinite(res.x) && Number.isFinite(res.y)) {
+                return { x: res.x, y: res.y };
+              }
+            }
+          }
+        } catch {
+          // Fall through to bounding rect calculation if matrix cannot be inverted
+        }
+      }
+
+      // Priority 2: Viewport-relative fallback using actual measured SVG canvas bounds
       const rect = svgRef.current.getBoundingClientRect();
-      const wx = (screenX - rect.left - dimensions.width / 2 - pan.x) / zoom;
-      const wy = (screenY - rect.top - dimensions.height / 2 - pan.y) / zoom;
+      const wx = (clientX - rect.left - rect.width / 2 - pan.x) / zoom;
+      const wy = (clientY - rect.top - rect.height / 2 - pan.y) / zoom;
       return { x: wx, y: wy };
     },
-    [dimensions.width, dimensions.height, pan.x, pan.y, zoom]
+    [pan.x, pan.y, zoom]
   );
 
   // ---------------------------------------------------------------------------
   // 6. Viewport Actions: Zoom, Pan, Fit-to-Screen
   // ---------------------------------------------------------------------------
-  const handleZoomIn = useCallback(() => {
-    setZoom((z) => Math.min(3.0, +(z * 1.2).toFixed(2)));
+  const applyZoomWithCenteredPan = useCallback((nextZoomRaw) => {
+    const nextZoom = +Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, nextZoomRaw)).toFixed(2);
+    const prevZoom = zoomRef.current || 1;
+    const ratio = nextZoom / prevZoom;
+    hasUserAdjustedViewportRef.current = true;
+    setZoom(nextZoom);
+    setPan((prevPan) => {
+      const nextPan = {
+        x: +(prevPan.x * ratio).toFixed(2),
+        y: +(prevPan.y * ratio).toFixed(2),
+      };
+      panRef.current = nextPan;
+      return nextPan;
+    });
+    zoomRef.current = nextZoom;
   }, []);
+
+  const handleZoomIn = useCallback(() => {
+    applyZoomWithCenteredPan(zoomRef.current * 1.2);
+  }, [applyZoomWithCenteredPan]);
 
   const handleZoomOut = useCallback(() => {
-    setZoom((z) => Math.max(0.3, +(z / 1.2).toFixed(2)));
-  }, []);
+    applyZoomWithCenteredPan(zoomRef.current / 1.2);
+  }, [applyZoomWithCenteredPan]);
 
-  const handleResetView = useCallback(() => {
-    setPan({ x: 0, y: 0 });
-    setZoom(1.0);
-  }, []);
+  const handleSetZoomPercent = useCallback(
+    (percent) => {
+      const num = Number(percent);
+      if (!Number.isFinite(num) || num <= 0) return;
+      applyZoomWithCenteredPan(num / 100);
+    },
+    [applyZoomWithCenteredPan]
+  );
 
   const handleFitToScreen = useCallback(() => {
-    if (!currentMol.atoms || currentMol.atoms.length === 0) {
-      handleResetView();
-      return;
-    }
-
-    let minX = Infinity,
-      maxX = -Infinity,
-      minY = Infinity,
-      maxY = -Infinity;
-
-    for (const a of currentMol.atoms) {
-      if (a.x < minX) minX = a.x;
-      if (a.x > maxX) maxX = a.x;
-      if (a.y < minY) minY = a.y;
-      if (a.y > maxY) maxY = a.y;
-    }
-
-    const molW = maxX - minX || BOND_LEN * 2;
-    const molH = maxY - minY || BOND_LEN * 2;
-    const centerX = (minX + maxX) / 2;
-    const centerY = (minY + maxY) / 2;
-
-    const pad = 90;
-    const availW = Math.max(100, dimensions.width - pad * 2);
-    const availH = Math.max(100, dimensions.height - pad * 2);
-
-    const fitScale = Math.min(availW / molW, availH / molH, 1.8);
-    const nextZoom = Math.max(0.4, Math.min(fitScale, 1.4));
-
-    setZoom(+nextZoom.toFixed(2));
-    setPan({
-      x: -centerX * nextZoom,
-      y: -centerY * nextZoom,
-    });
-  }, [currentMol.atoms, dimensions.width, dimensions.height, handleResetView]);
+    hasUserAdjustedViewportRef.current = false;
+    fitMoleculeToViewport(currentMolRef.current, dimensionsRef.current);
+  }, [fitMoleculeToViewport]);
 
   // Clean 2D Coordinates using OpenChemLib layout
   const handleCleanStructure = useCallback(() => {
     if (!currentMol.atoms || currentMol.atoms.length === 0) return;
     try {
       const cleaned = cleanStructure(currentMol);
-      pushState(cleaned);
-      setTimeout(handleFitToScreen, 50);
+      pushState(cleaned, false);
+      fitMoleculeToViewport(cleaned, dimensionsRef.current);
       showToast("Cleaned 2D coordinates layout.");
     } catch (e) {
       console.warn("Could not clean structure:", e);
       showToast("Unable to clean coordinates for this structure.");
     }
-  }, [currentMol, pushState, handleFitToScreen, showToast]);
+  }, [currentMol, pushState, fitMoleculeToViewport, showToast]);
+
+  // Import SMILES or Molfile structure directly into the canvas
+  const handleImportSubmit = useCallback(
+    (e) => {
+      if (e) e.preventDefault();
+      const raw = importText.trim();
+      if (!raw) {
+        setImportError("Please paste a valid SMILES string or MDL Molfile.");
+        return;
+      }
+      try {
+        const isMolfile =
+          raw.includes("V2000") ||
+          raw.includes("V3000") ||
+          raw.includes("M  END") ||
+          raw.split(/\r?\n/).length > 3;
+        const importedMol = isMolfile ? molFromMolfile(raw) : molFromSmiles(raw);
+        if (!importedMol || !importedMol.atoms || importedMol.atoms.length === 0) {
+          setImportError("Parsed structure contains 0 atoms. Check your input format.");
+          return;
+        }
+        hasUserAdjustedViewportRef.current = false;
+        pushState(importedMol, false);
+        fitMoleculeToViewport(importedMol, dimensionsRef.current);
+        setShowImportModal(false);
+        setImportText("");
+        setImportError(null);
+        showToast(`Imported structure (${importedMol.atoms.length} atoms) onto canvas.`);
+      } catch (err) {
+        setImportError(err?.message || "Could not parse structure. Please check the SMILES or Molfile syntax.");
+      }
+    },
+    [importText, pushState, fitMoleculeToViewport, showToast]
+  );
 
   // ---------------------------------------------------------------------------
   // 7. Mouse Wheel Zoom & Middle-Button Pan
   // ---------------------------------------------------------------------------
-  const handleWheel = useCallback(
-    (e) => {
+  useEffect(() => {
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+    const onWheel = (e) => {
       e.preventDefault();
       const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-      setZoom((prevZoom) => {
-        const nextZoom = Math.max(0.3, Math.min(3.0, +(prevZoom * zoomFactor).toFixed(2)));
-        return nextZoom;
-      });
-    },
-    []
-  );
+      applyZoomWithCenteredPan(zoomRef.current * zoomFactor);
+    };
+    svgEl.addEventListener("wheel", onWheel, { passive: false });
+    return () => svgEl.removeEventListener("wheel", onWheel);
+  }, [applyZoomWithCenteredPan]);
 
   // ---------------------------------------------------------------------------
   // 8. Keyboard Shortcuts
@@ -654,10 +797,15 @@ export default function DesktopMolecularEditor({
       if (dragModeRef.current === "pan") {
         const dx = e.clientX - dragStartRef.current.screenX;
         const dy = e.clientY - dragStartRef.current.screenY;
-        setPan({
+        const nextPan = {
           x: dragStartRef.current.panX + dx,
           y: dragStartRef.current.panY + dy,
-        });
+        };
+        if (Math.hypot(dx, dy) > 4) {
+          hasUserAdjustedViewportRef.current = true;
+        }
+        panRef.current = nextPan;
+        setPan(nextPan);
         return;
       }
 
@@ -677,6 +825,7 @@ export default function DesktopMolecularEditor({
         });
 
         // Do direct state update during drag (without pushing 60 history frames per second)
+        isInternalEditRef.current = true;
         if (isControlled) {
           onMolChange({ ...currentMol, atoms: updatedAtoms });
         } else {
@@ -739,7 +888,7 @@ export default function DesktopMolecularEditor({
               showToast(`Changed atom to ${currentElement}`);
             } else {
               // Same element -> add substituent branch!
-              const next = addSubstituent(currentMol, fromAtomId, currentBondOrder, currentElement);
+              const next = addSubstituent(currentMol, fromAtomId, currentElement, currentBondOrder);
               pushState(next);
               showToast(`Added ${currentElement} branch`);
             }
@@ -775,7 +924,7 @@ export default function DesktopMolecularEditor({
   );
 
   // ---------------------------------------------------------------------------
-  // 10. Filtered Periodic Table Elements
+  // 10. Filtered Periodic Table Elements & Zoom Display
   // ---------------------------------------------------------------------------
   const filteredElements = useMemo(() => {
     if (!periodicFilter.trim()) return ALL_ELEMENTS;
@@ -787,6 +936,12 @@ export default function DesktopMolecularEditor({
         String(el.number).includes(q)
     );
   }, [periodicFilter]);
+
+  const zoomPercent = Math.round(zoom * 100);
+  const zoomOptions = useMemo(() => {
+    const set = new Set([...ZOOM_PRESETS, zoomPercent]);
+    return Array.from(set).sort((a, b) => a - b);
+  }, [zoomPercent]);
 
   // ---------------------------------------------------------------------------
   // 11. Render Component
@@ -953,14 +1108,15 @@ export default function DesktopMolecularEditor({
           </div>
         </div>
 
-        {/* Right Section: Undo/Redo, Clean, Zoom, Reset */}
-        <div className="flex items-center gap-1.5">
+        {/* Right Section: Undo/Redo, Import, Clean, Zoom, Fit */}
+        <div className="flex items-center flex-wrap gap-1.5">
           <button
             type="button"
             onClick={handleUndo}
             disabled={!canUndo}
             className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             title="Undo (Ctrl+Z)"
+            aria-label="Undo"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
@@ -973,10 +1129,23 @@ export default function DesktopMolecularEditor({
             disabled={!canRedo}
             className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             title="Redo (Ctrl+Y)"
+            aria-label="Redo"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M15 15l6-6m0 0l-6-6m6 6H9a6 6 0 000 12h3" />
             </svg>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setImportError(null);
+              setShowImportModal(true);
+            }}
+            className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 font-medium transition-colors cursor-pointer"
+            title="Import structure from SMILES or Molfile"
+          >
+            Import
           </button>
 
           <button
@@ -1001,37 +1170,63 @@ export default function DesktopMolecularEditor({
 
           <span className="w-px h-5 bg-slate-300 mx-1" />
 
-          {/* Zoom controls */}
-          <button
-            type="button"
-            onClick={handleZoomIn}
-            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
-            title="Zoom In (+)"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-            </svg>
-          </button>
+          {/* Unified Zoom & Fit-to-Screen Controls */}
+          <div className="flex items-center bg-white rounded-lg border border-slate-200 p-0.5 gap-0.5">
+            <button
+              type="button"
+              onClick={handleZoomOut}
+              disabled={zoom <= MIN_ZOOM}
+              className="p-1.5 rounded-md text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              title="Zoom Out (−)"
+              aria-label="Zoom Out"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12h-15" />
+              </svg>
+            </button>
 
-          <button
-            type="button"
-            onClick={handleZoomOut}
-            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
-            title="Zoom Out (-)"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12h-15" />
-            </svg>
-          </button>
+            <select
+              value={zoomPercent}
+              onChange={(e) => handleSetZoomPercent(Number(e.target.value))}
+              aria-label="Zoom Percentage"
+              title="Zoom Percentage"
+              className="px-1.5 py-1 text-xs font-semibold text-slate-700 bg-transparent hover:bg-slate-100 rounded-md focus:outline-none cursor-pointer font-mono"
+            >
+              {zoomOptions.map((pct) => (
+                <option key={pct} value={pct}>
+                  {pct}%
+                </option>
+              ))}
+            </select>
 
-          <button
-            type="button"
-            onClick={handleFitToScreen}
-            className="px-2 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 font-medium transition-colors cursor-pointer"
-            title="Fit molecule to canvas (Shortcut: 0)"
-          >
-            Fit
-          </button>
+            <button
+              type="button"
+              onClick={handleZoomIn}
+              disabled={zoom >= MAX_ZOOM}
+              className="p-1.5 rounded-md text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              title="Zoom In (+)"
+              aria-label="Zoom In"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+              </svg>
+            </button>
+
+            <span className="w-px h-4 bg-slate-200 mx-0.5" />
+
+            <button
+              type="button"
+              onClick={handleFitToScreen}
+              className="px-2 py-1 rounded-md text-slate-700 hover:bg-indigo-50 hover:text-indigo-700 font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+              title="Fit Structure to Screen (Shortcut: 0)"
+              aria-label="Fit to Screen"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+              </svg>
+              <span>Fit to Screen</span>
+            </button>
+          </div>
 
           {onSwitchToMobile && (
             <button
@@ -1098,7 +1293,10 @@ export default function DesktopMolecularEditor({
         </aside>
 
         {/* Main Molecular Canvas Area */}
-        <div className="flex-1 relative w-full h-full min-h-[500px] overflow-hidden cursor-crosshair">
+        <div
+          ref={canvasContainerRef}
+          className="flex-1 relative w-full h-full min-h-[500px] overflow-hidden cursor-crosshair"
+        >
           {/* Toast Notification */}
           {toastMsg && (
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 bg-slate-900/90 text-white text-xs font-medium px-4 py-1.5 rounded-full shadow-lg backdrop-blur-md animate-in fade-in slide-in-from-top-1 pointer-events-none">
@@ -1117,7 +1315,6 @@ export default function DesktopMolecularEditor({
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
-            onWheel={handleWheel}
             role="region"
             aria-label="Desktop Molecular Drawing Canvas"
           >
@@ -1396,8 +1593,8 @@ export default function DesktopMolecularEditor({
                         const { mol: nextM } = addAtom(EMPTY_MOL, -20, 0, "C");
                         const { mol: chainM } = addAtom(nextM, 20, 0, "C");
                         const chained = addBond(chainM, chainM.atoms[0].id, chainM.atoms[1].id, 1);
-                        pushState(chained);
-                        setTimeout(handleFitToScreen, 50);
+                        pushState(chained, false);
+                        fitMoleculeToViewport(chained, dimensionsRef.current);
                       }}
                       className="px-2.5 py-1 text-xs font-semibold bg-slate-100 hover:bg-slate-200 rounded-lg text-slate-700 transition-colors cursor-pointer"
                     >
@@ -1406,8 +1603,9 @@ export default function DesktopMolecularEditor({
                     <button
                       type="button"
                       onClick={() => {
-                        pushState(placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true));
-                        setTimeout(handleFitToScreen, 50);
+                        const ringMol = placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true);
+                        pushState(ringMol, false);
+                        fitMoleculeToViewport(ringMol, dimensionsRef.current);
                       }}
                       className="px-2.5 py-1 text-xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg transition-colors cursor-pointer"
                     >
@@ -1416,8 +1614,9 @@ export default function DesktopMolecularEditor({
                     <button
                       type="button"
                       onClick={() => {
-                        pushState(placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, false));
-                        setTimeout(handleFitToScreen, 50);
+                        const ringMol = placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, false);
+                        pushState(ringMol, false);
+                        fitMoleculeToViewport(ringMol, dimensionsRef.current);
                       }}
                       className="px-2.5 py-1 text-xs font-semibold bg-slate-100 hover:bg-slate-200 rounded-lg text-slate-700 transition-colors cursor-pointer"
                     >
@@ -1588,6 +1787,77 @@ export default function DesktopMolecularEditor({
                 );
               })}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Import Structure Modal (SMILES / MDL Molfile)                      */}
+      {/* ------------------------------------------------------------------ */}
+      {showImportModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-5 shadow-2xl border border-slate-200 flex flex-col gap-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Import Molecular Structure</h3>
+                <p className="text-xs text-slate-500">
+                  Paste a SMILES string or MDL Molfile (V2000/V3000) to render centered on canvas
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowImportModal(false);
+                  setImportError(null);
+                }}
+                className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center transition-colors cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleImportSubmit} className="space-y-3">
+              <div>
+                <label className="text-xs font-semibold text-slate-700 block mb-1">
+                  SMILES or Molfile Content
+                </label>
+                <textarea
+                  rows={5}
+                  value={importText}
+                  onChange={(e) => {
+                    setImportText(e.target.value);
+                    if (importError) setImportError(null);
+                  }}
+                  placeholder="e.g. CC(=O)Nc1ccc(O)cc1 (Paracetamol) or paste V2000 Molfile..."
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl border border-slate-300 focus:outline-hidden focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+
+              {importError && (
+                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg p-2.5">
+                  {importError}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowImportModal(false);
+                    setImportError(null);
+                  }}
+                  className="px-3.5 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-xs transition-colors cursor-pointer"
+                >
+                  Load Structure
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
