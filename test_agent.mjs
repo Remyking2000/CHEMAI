@@ -119,7 +119,14 @@ console.log("--- Starting ChemAI Agent Core Tests ---");
   assert(res.reply.includes("4n+2"), "General question: direct answer returned");
   assert(calls.length === 0 && res.agent.toolCalls.length === 0, "General question: no external tool/lookup invoked");
   assert(res.agent.mode === "native" && res.agent.stopReason === "final_answer", "General question: native mode, final_answer stop reason");
-  assert(Array.isArray(requests[0].tools) && requests[0].tools.length === 5 && requests[0].tool_choice === "auto", "Model is offered the 5 allowlisted tools with tool_choice=auto");
+  assert(
+    Array.isArray(requests[0].tools) &&
+      requests[0].tools.length === 9 &&
+      requests[0].tools.some((t) => t.function?.name === "read_editor_structure") &&
+      requests[0].tools.some((t) => t.function?.name === "generate_structure") &&
+      requests[0].tool_choice === "auto",
+    "Model is offered the 9 allowlisted tools (5 server + 4 client) with tool_choice=auto"
+  );
 }
 
 /* 2 + 3. Structure generation invokes tool; result is used in the final answer */

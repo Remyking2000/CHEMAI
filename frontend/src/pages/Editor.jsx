@@ -6,6 +6,7 @@ import DesktopMolecularEditor from "../components/DesktopMolecularEditor";
 import MobileMolecularEditor from "../components/MobileMolecularEditor";
 import { useMoleculeManager } from "../lib/useMoleculeManager";
 import { createEditorBridge, registerEditorBridge } from "../lib/editorBridge";
+import { sendAgentChat } from "../lib/agentHandshake";
 import { API_ROUTES } from "../config/api";
 
 // Quick example templates to test and draw
@@ -111,6 +112,107 @@ export default function MolecularEditor() {
   const bridgeRef = useRef(null);
   const [pendingBridgeReplacement, setPendingBridgeReplacement] = useState(null);
 
+  // Phase 2B: Interactive ChemAI Assistant Drawer (Live Editor Handshake)
+  const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatAgentStatus, setChatAgentStatus] = useState("");
+  const chatDrawerEndRef = useRef(null);
+
+  useEffect(() => {
+    if (isChatDrawerOpen) {
+      chatDrawerEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatMessages, chatLoading, isChatDrawerOpen]);
+
+  const handleNavigateToFullChat = () => {
+    let compound = identifyResult ? buildCompoundContext(identifyResult) : null;
+    if (!compound && identifyError?.fallbackCompound) {
+      compound = buildCompoundContext(identifyError.fallbackCompound);
+    }
+    navigate("/chat", {
+      state: {
+        compound,
+        loadSmiles: moleculeManager.exportCurrent()?.smiles || undefined,
+      },
+    });
+  };
+
+  const handleSendChatMessage = async (textToSend = chatInput) => {
+    if (chatLoading) return;
+    const trimmed = (textToSend || "").trim();
+    if (!trimmed) return;
+
+    const activeCompound = identifyResult ? buildCompoundContext(identifyResult) : null;
+    const userMessage = {
+      id: `user-${Date.now()}`,
+      sender: "user",
+      text: trimmed,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    };
+
+    const currentHistory = chatMessages
+      .filter((m) => !m.isError)
+      .map((m) => ({
+        role: m.sender === "user" ? "user" : "assistant",
+        content: m.text,
+      }));
+
+    setChatMessages((prev) => [...prev, userMessage]);
+    setChatInput("");
+    setChatLoading(true);
+    setChatAgentStatus("");
+
+    try {
+      const data = await sendAgentChat({
+        message: trimmed,
+        history: currentHistory,
+        compound: activeCompound,
+        onStatusChange: (s) => {
+          if (s.status === "executing_action") {
+            const toolLabels = {
+              read_editor_structure: "Inspecting canvas molecule...",
+              load_structure_into_editor: "Loading structure onto canvas...",
+              fit_canvas_view: "Centering canvas view...",
+              get_editor_capabilities: "Checking editor capabilities...",
+            };
+            setChatAgentStatus(toolLabels[s.action?.tool] || `Executing: ${s.action?.tool}...`);
+          } else {
+            setChatAgentStatus("");
+          }
+        },
+      });
+
+      const assistantMessage = {
+        id: `assistant-${Date.now()}`,
+        sender: "assistant",
+        text: data.reply,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        provider: data.provider,
+        model: data.model,
+      };
+
+      setChatMessages((prev) => [...prev, assistantMessage]);
+    } catch (err) {
+      console.error("[Editor AI Chat] Error:", err);
+      const errMsg = err?.message || "Failed to communicate with ChemAI service.";
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: `assistant-err-${Date.now()}`,
+          sender: "assistant",
+          text: `⚠️ **Unable to complete request**\n\n${errMsg}`,
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          isError: true,
+        },
+      ]);
+    } finally {
+      setChatLoading(false);
+      setChatAgentStatus("");
+    }
+  };
+
   const renderBridgeApprovalModal = () => {
     if (!pendingBridgeReplacement) return null;
     return (
@@ -158,6 +260,158 @@ export default function MolecularEditor() {
               Approve & Replace
             </button>
           </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderChatDrawer = () => {
+    if (!isChatDrawerOpen) return null;
+    return (
+      <div className="fixed inset-y-0 right-0 z-50 w-full sm:w-96 lg:w-[440px] bg-slate-900/98 backdrop-blur-md border-l border-slate-700/80 shadow-2xl flex flex-col animate-in slide-in-from-right duration-200 text-slate-100">
+        {/* Header */}
+        <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white shadow-sm">
+              <ChemAINeuralHexIcon className="w-4 h-4 text-white" />
+            </div>
+            <div>
+              <div className="flex items-center gap-1.5">
+                <h3 className="font-bold text-sm text-white">ChemAI Assistant</h3>
+                <span className="text-[10px] bg-cyan-900/60 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/50 font-mono">
+                  Editor Connected
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400">Can inspect, draw & center your canvas</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={handleNavigateToFullChat}
+              className="p-1.5 text-xs text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              title="Open in full-page chat"
+            >
+              ↗ Full Page
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsChatDrawerOpen(false)}
+              className="p-1.5 text-xs text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              title="Close Assistant"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {/* Quick Prompts */}
+        <div className="p-2.5 bg-slate-950/40 border-b border-slate-800/80 flex items-center gap-1.5 overflow-x-auto text-[11px] no-scrollbar">
+          <button
+            type="button"
+            onClick={() => handleSendChatMessage("What molecule is currently on my canvas? Identify and explain it.")}
+            disabled={chatLoading}
+            className="px-2 py-1 bg-slate-800/90 hover:bg-slate-700 text-cyan-300 rounded-md border border-cyan-800/40 whitespace-nowrap cursor-pointer transition-colors"
+          >
+            🔬 Identify canvas
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSendChatMessage("Draw caffeine in my editor.")}
+            disabled={chatLoading}
+            className="px-2 py-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 rounded-md border border-slate-700/50 whitespace-nowrap cursor-pointer transition-colors"
+          >
+            ☕ Draw caffeine
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSendChatMessage("Center and frame my canvas view.")}
+            disabled={chatLoading}
+            className="px-2 py-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 rounded-md border border-slate-700/50 whitespace-nowrap cursor-pointer transition-colors"
+          >
+            🎯 Center view
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSendChatMessage("What capabilities does my molecular editor have?")}
+            disabled={chatLoading}
+            className="px-2 py-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 rounded-md border border-slate-700/50 whitespace-nowrap cursor-pointer transition-colors"
+          >
+            ⚙️ Capabilities
+          </button>
+        </div>
+
+        {/* Message Feed */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-3 text-xs">
+          {chatMessages.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-2">
+              <div className="w-12 h-12 rounded-2xl bg-cyan-950/40 border border-cyan-800/30 flex items-center justify-center text-cyan-400 mb-1">
+                <ChemAINeuralHexIcon className="w-6 h-6" />
+              </div>
+              <p className="font-semibold text-slate-200">How can ChemAI help your drawing?</p>
+              <p className="text-[11px] text-slate-400 max-w-xs">
+                Ask me to read the molecule on your canvas, draw any compound, center your view, or explain chemical concepts.
+              </p>
+            </div>
+          ) : (
+            chatMessages.map((msg) => (
+              <div
+                key={msg.id}
+                className={`flex flex-col ${msg.sender === "user" ? "items-end" : "items-start"}`}
+              >
+                <div
+                  className={`max-w-[88%] rounded-2xl p-3 leading-relaxed ${
+                    msg.sender === "user"
+                      ? "bg-cyan-600 text-white rounded-tr-xs"
+                      : msg.isError
+                      ? "bg-red-950/80 border border-red-800/60 text-red-200 rounded-tl-xs"
+                      : "bg-slate-800/90 border border-slate-700/60 text-slate-200 rounded-tl-xs"
+                  }`}
+                >
+                  <p className="whitespace-pre-wrap">{msg.text}</p>
+                </div>
+                <span className="text-[10px] text-slate-500 mt-1 px-1">{msg.timestamp}</span>
+              </div>
+            ))
+          )}
+
+          {chatLoading && (
+            <div className="flex items-start gap-2 text-slate-300 p-3 bg-slate-800/60 rounded-xl border border-slate-700/50">
+              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping mt-1" />
+              <div className="space-y-0.5">
+                <p className="text-[11px] font-semibold text-cyan-300">ChemAI is working...</p>
+                <p className="text-[10px] text-slate-400 animate-pulse">{chatAgentStatus || "Reasoning..."}</p>
+              </div>
+            </div>
+          )}
+          <div ref={chatDrawerEndRef} />
+        </div>
+
+        {/* Input */}
+        <div className="p-3 bg-slate-950 border-t border-slate-800">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSendChatMessage();
+            }}
+            className="flex items-center gap-2"
+          >
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="Ask ChemAI about your canvas..."
+              disabled={chatLoading}
+              className="flex-1 bg-slate-900 border border-slate-700 text-slate-200 placeholder-slate-500 text-xs px-3 py-2 rounded-xl focus:outline-none focus:border-cyan-500"
+            />
+            <button
+              type="submit"
+              disabled={chatLoading || !chatInput.trim()}
+              className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-50 transition-all cursor-pointer"
+            >
+              Send
+            </button>
+          </form>
         </div>
       </div>
     );
@@ -399,33 +653,23 @@ export default function MolecularEditor() {
     };
   };
 
-  // Open ChemAI Chat with optional compound context and prompt
+  // Open ChemAI Assistant Drawer (with live editor bridge)
   const handleOpenChat = (promptOverride = null) => {
-    let compound = identifyResult ? buildCompoundContext(identifyResult) : null;
-    if (!compound && identifyError?.fallbackCompound) {
-      compound = buildCompoundContext(identifyError.fallbackCompound);
+    setIsChatDrawerOpen(true);
+    if (promptOverride && typeof promptOverride === "string") {
+      handleSendChatMessage(promptOverride);
     }
-    navigate("/chat", {
-      state: {
-        compound,
-        initialPrompt: promptOverride || undefined,
-      },
-    });
   };
 
-  // Phase 2 Unified: Open Chat and immediately generate explanation for identified molecule
+  // Phase 2 Unified: Open Assistant and immediately generate explanation for identified molecule
   const handleExplainStructure = () => {
     if (!identifyResult) {
       showStatus("Identify a molecule first to generate a chemistry explanation.");
       return;
     }
-    const compound = buildCompoundContext(identifyResult);
-    navigate("/chat", {
-      state: {
-        compound,
-        initialPrompt: `Explain the molecular structure, functional groups, and chemical properties of ${identifyResult.name} (${identifyResult.molecularFormula || ""}).`,
-      },
-    });
+    handleOpenChat(
+      `Explain the molecular structure, functional groups, and chemical properties of ${identifyResult.name}${identifyResult.molecularFormula ? ` (${identifyResult.molecularFormula})` : ""}.`
+    );
   };
 
   // Clear current molecular structure
@@ -1018,6 +1262,7 @@ export default function MolecularEditor() {
           )}
         </div>
         {renderBridgeApprovalModal()}
+        {renderChatDrawer()}
       </div>
     );
   }
@@ -2314,6 +2559,7 @@ export default function MolecularEditor() {
         )}
       </main>
       {renderBridgeApprovalModal()}
+      {renderChatDrawer()}
     </div>
   );
 }

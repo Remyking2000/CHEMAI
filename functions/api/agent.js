@@ -1,11 +1,16 @@
 /**
  * ==============================================================================
- * ChemAI — Central Chemistry Agent Core (Phase 1)
+ * ChemAI — Central Chemistry Agent Core (Phase 1 & Phase 2B)
  * ------------------------------------------------------------------------------
  * A controlled, tool-using agent loop. The AI model decides whether it can answer
- * directly or whether it needs one of the registered chemistry tools. Tools are
- * thin adapters over the EXISTING API handlers (identify, lookup, analyze,
- * generate-structure, explain-structure) — no chemistry logic is duplicated here.
+ * directly or whether it needs one of the registered chemistry or editor tools.
+ *
+ * Tools have clear runtime separation:
+ *   - "server": executed in-process on Cloudflare Workers (generate_structure,
+ *               identify_structure, lookup_structure, analyze_compound, explain_structure).
+ *   - "client": dispatched to the user's browser editor bridge via a controlled
+ *               action-required handshake (read_editor_structure,
+ *               load_structure_into_editor, fit_canvas_view, get_editor_capabilities).
  *
  * Two execution modes:
  *   - "native":     OpenRouter OpenAI-compatible function calling (`tools` param),
@@ -14,11 +19,8 @@
  *                   gateway, for models/providers without function calling.
  *
  * Safety: allowlisted tool names, schema-validated arguments, bounded iterations,
- * per-call and total time budgets, truncated tool output, no arbitrary code
- * execution, and no logging of keys or headers.
- *
- * This module is dependency-injected (callAI, fetch, registry) so it can be unit
- * tested without network access or paid API calls.
+ * per-call and total time budgets, user approval boundaries for canvas overwrites,
+ * truncated tool output, no arbitrary code execution, and no logging of keys.
  * ==============================================================================
  */
 
@@ -84,6 +86,66 @@ async function fetchWithTimeout(fetchImpl, url, options, ms) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Continuation Token (stateless handshake for client tool execution)         */
+/* -------------------------------------------------------------------------- */
+
+export function createContinuationToken(payload) {
+  const jsonStr = JSON.stringify({
+    ts: Date.now(),
+    ...payload,
+  });
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(jsonStr, "utf-8").toString("base64url");
+  }
+  const bytes = new TextEncoder().encode(jsonStr);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function decodeContinuationToken(token) {
+  if (typeof token !== "string" || !token.trim()) {
+    throw new Error("Missing or empty continuation token.");
+  }
+  let jsonStr = "";
+  try {
+    let base64 = token.replace(/-/g, "+").replace(/_/g, "/");
+    while (base64.length % 4) base64 += "=";
+    if (typeof Buffer !== "undefined") {
+      jsonStr = Buffer.from(base64, "base64").toString("utf-8");
+    } else {
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) {
+        bytes[i] = bin.charCodeAt(i);
+      }
+      jsonStr = new TextDecoder().decode(bytes);
+    }
+  } catch {
+    throw new Error("Malformed continuation token.");
+  }
+
+  let data;
+  try {
+    data = JSON.parse(jsonStr);
+  } catch {
+    throw new Error("Invalid continuation token payload.");
+  }
+
+  if (!data || typeof data !== "object") {
+    throw new Error("Invalid continuation token structure.");
+  }
+
+  if (typeof data.ts === "number" && Date.now() - data.ts > 10 * 60 * 1000) {
+    throw new Error("Continuation token has expired. Please resubmit your request.");
+  }
+
+  return data;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -198,11 +260,11 @@ const SMILES_PATTERN = "^[A-Za-z0-9@+\\-\\[\\]()=#$/\\\\%.:*]+$";
  *   generateStructure(body, env), identify(body, env), lookupStructure(body, env),
  *   analyze(body, env), explainStructure(body, env)
  *
- * Every tool declares `runtime`. Only `"server"` tools execute in this backend.
- * Phase 2 will add `"client"` tools (read/load editor structure, add atoms/bonds,
- * select regions, zoom/fit, confirm operations) that are executed by the browser
- * editor through a controlled frontend-to-agent interface — they are intentionally
- * NOT registered here, and the loop refuses to run any non-server tool.
+ * Every tool declares `runtime`:
+ *   - "server": executed in-process on Cloudflare Workers by invokeHandler.
+ *   - "client": dispatched to the user's browser editor bridge via action-required
+ *               continuation handshake (read_editor_structure, load_structure_into_editor,
+ *               fit_canvas_view, get_editor_capabilities).
  */
 export function createToolRegistry(handlers) {
   const fail = (r, fallback) => ({
@@ -395,6 +457,63 @@ export function createToolRegistry(handlers) {
         };
       },
     },
+    {
+      name: "read_editor_structure",
+      runtime: "client",
+      provenance: "client_editor_bridge",
+      description:
+        "Read the current molecular structure drawn on the user's active molecular editor canvas. Returns the current SMILES, formula, atom/bond counts, and whether the canvas contains a molecule. Use this whenever the user asks about what they drew, their canvas, or 'this structure'.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "load_structure_into_editor",
+      runtime: "client",
+      provenance: "client_editor_bridge",
+      description:
+        "Load a validated molecular structure (SMILES) into the user's active molecular editor canvas. If the canvas already contains a structure, the user will be prompted for approval before replacing it. Center and fit will automatically be applied. Use this when the user asks to draw, build, or load a molecule into the editor.",
+      parameters: {
+        type: "object",
+        properties: {
+          smiles: {
+            type: "string",
+            minLength: 1,
+            maxLength: 500,
+            pattern: SMILES_PATTERN,
+            description: "Validated SMILES string of the molecule to load into the editor.",
+          },
+        },
+        required: ["smiles"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "fit_canvas_view",
+      runtime: "client",
+      provenance: "client_editor_bridge",
+      description:
+        "Center and zoom-to-fit the visible canvas view around the molecule in the active editor. Does not modify the molecular structure. Use when the user asks to center, frame, or zoom their drawing.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "get_editor_capabilities",
+      runtime: "client",
+      provenance: "client_editor_bridge",
+      description:
+        "Inspect the capabilities, readiness status, and active view mode (desktop or mobile) of the user's molecular editor.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
   ];
 
   return new Map(tools.map((t) => [t.name, t]));
@@ -402,7 +521,6 @@ export function createToolRegistry(handlers) {
 
 function toOpenAITools(registry) {
   return [...registry.values()]
-    .filter((t) => t.runtime === "server")
     .map((t) => ({
       type: "function",
       function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -438,21 +556,29 @@ Anchor your explanations to this molecule when relevant. Distinguish verified fa
 
 TOOL USE POLICY (you decide):
 - Answer directly, without tools, whenever you can do so reliably from chemistry knowledge (concepts, mechanisms, trends, general explanations).
-- Call a tool only when it supplies evidence you actually need: a specific structure, a reference identity, candidate structures, exact reference properties, or a structured explanation of a specific molecule.
+- Call a tool only when it supplies evidence or performs actions you actually need:
+  * Server tools: generate_structure, identify_structure, lookup_structure, analyze_compound, explain_structure.
+  * Client editor tools: read_editor_structure, load_structure_into_editor, fit_canvas_view, get_editor_capabilities.
+- To inspect or answer questions about what the user has drawn on the canvas, call read_editor_structure. Inspect its result (smiles, atomCount, isEmpty). If the user asks for identity or explanation, take the returned SMILES and call identify_structure or explain_structure.
+- To draw or load a molecule into the user's editor, first obtain or verify its SMILES (using lookup_structure or generate_structure if needed), then call load_structure_into_editor with the SMILES.
+- To center, frame, or fit the canvas view, call fit_canvas_view.
 - Gather only what the user's goal requires. Inspect each tool result before deciding the next step. You may call several tools in sequence (at most ${AGENT_LIMITS.MAX_TOOL_ITERATIONS} tool rounds).
 - Never describe an AI-generated structure as verified unless a reference tool (identify_structure, lookup_structure, analyze_compound) confirmed it.
 - In the final answer, clearly separate reference data retrieved from external sources (e.g. PubChem) from your own interpretation, and state uncertainty where appropriate.
-- If a tool fails, try one reasonable alternative or explain the limitation. Never repeat an identical failed call.
-- You cannot control or modify the user's molecular editor; do not claim to have drawn or loaded anything into it.`;
+- If a client editor tool reports that the editor is unavailable (e.g. user is in standalone chat without an active editor), clearly explain that no editor is currently open on this page and answer conceptually or suggest opening the Molecular Editor at /editor.
+- If a client editor tool reports that structure replacement was declined or cancelled by the user, respect their decision and explain what was kept.
+- If read_editor_structure reports an empty canvas (0 atoms), inform the user that the canvas is currently blank.
+- If a tool fails, try one reasonable alternative or explain the limitation. Never repeat an identical failed call.`;
 
   if (mode === "structured") {
     const toolLines = [...registry.values()]
-      .filter((t) => t.runtime === "server")
       .map((t) => {
-        const args = Object.entries(t.parameters.properties)
+        const props = t.parameters?.properties || {};
+        const args = Object.entries(props)
           .map(([k, v]) => `${k}${t.parameters.required?.includes(k) ? "" : "?"}: ${v.type}${v.enum ? ` (${v.enum.join("|")})` : ""}`)
           .join(", ");
-        return `- ${t.name}(${args}) — ${t.description}`;
+        const tag = t.runtime === "client" ? " [client editor tool]" : " [server tool]";
+        return `- ${t.name}(${args})${tag} — ${t.description}`;
       })
       .join("\n");
     prompt += `
@@ -770,6 +896,9 @@ export async function runAgent({
   message,
   history = [],
   compound = null,
+  sessionId = null,
+  continuationToken = null,
+  clientActionResult = null,
   env = {},
   registry,
   callAI,
@@ -778,18 +907,69 @@ export async function runAgent({
   limits = AGENT_LIMITS,
 }) {
   if (!registry || !callAI) throw new Error("Agent misconfigured: registry and callAI are required.");
-  const started = now();
-  const deadline = started + limits.TOTAL_BUDGET_MS;
-  const convHistory = normalizeHistory(history);
-  const userMessage = truncate(String(message || "").trim(), limits.MAX_MESSAGE_CHARS);
-
+  let started = now();
+  let convHistory = normalizeHistory(history);
+  let userMessage = truncate(String(message || "").trim(), limits.MAX_MESSAGE_CHARS);
+  let activeCompound = compound;
+  let activeSessionId = sessionId;
   let mode = openRouterKey(env) ? "native" : "structured";
-  const ctx = { env, compound };
-  const steps = [];
-  const trace = [];
+  let steps = [];
+  let trace = [];
+  let iterations = 0;
+
+  if (continuationToken) {
+    const tokenData = decodeContinuationToken(continuationToken);
+    userMessage = tokenData.message || userMessage;
+    convHistory = Array.isArray(tokenData.history) ? tokenData.history : convHistory;
+    activeCompound = tokenData.compound !== undefined ? tokenData.compound : activeCompound;
+    activeSessionId = tokenData.sessionId || activeSessionId;
+    steps = Array.isArray(tokenData.steps) ? tokenData.steps : [];
+    trace = Array.isArray(tokenData.trace) ? tokenData.trace : [];
+    iterations = typeof tokenData.iterations === "number" ? tokenData.iterations : iterations;
+    mode = tokenData.mode || mode;
+    if (typeof tokenData.started === "number") started = tokenData.started;
+
+    if (clientActionResult && tokenData.pendingCall) {
+      const pending = tokenData.pendingCall;
+      const resPayload = clientActionResult.result || {};
+      const isOk = Boolean(resPayload.ok);
+      const toolResult = {
+        ok: isOk,
+        provenance: "client_editor_bridge",
+        ...(isOk ? { data: resPayload.data || {} } : { error: sanitizeText(resPayload.error || "Client tool execution failed.") }),
+        ...(resPayload.cancelled ? { cancelled: true } : {}),
+        ...(resPayload.unavailable ? { unavailable: true } : {}),
+        ...(resPayload.needsApproval ? { needsApproval: true } : {}),
+      };
+
+      steps.push({
+        turn: iterations,
+        id: pending.id,
+        name: pending.name,
+        rawArguments: pending.rawArguments,
+        parsedArguments: pending.parsedArguments,
+        assistantContent: pending.assistantContent || "",
+        result: toolResult,
+      });
+
+      trace.push({
+        name: pending.name,
+        arguments: pending.parsedArguments,
+        ok: isOk,
+        rejected: Boolean(resPayload.rejected),
+        error: isOk ? undefined : sanitizeText(resPayload.error || "Client tool execution failed."),
+        provenance: "client_editor_bridge",
+        durationMs: 0,
+      });
+
+      console.info(`[ChemAI Agent] client_tool=${pending.name} ok=${isOk}`);
+    }
+  }
+
+  const deadline = started + limits.TOTAL_BUDGET_MS;
+  const ctx = { env, compound: activeCompound };
   const failedSignatures = new Set();
   const resultCache = new Map();
-  let iterations = 0;
   let provider = null;
   let model = null;
   let reply = null;
@@ -870,12 +1050,12 @@ export async function runAgent({
 
     let decision = null;
     if (mode === "native") {
-      decision = await nativeNext({ ...shared, systemPrompt: buildAgentSystemPrompt(compound, registry, "native") });
+      decision = await nativeNext({ ...shared, systemPrompt: buildAgentSystemPrompt(activeCompound, registry, "native") });
       if (!decision) mode = "structured";
     }
     if (mode === "structured") {
       try {
-        decision = await structuredNext({ ...shared, systemPrompt: buildAgentSystemPrompt(compound, registry, "structured") });
+        decision = await structuredNext({ ...shared, systemPrompt: buildAgentSystemPrompt(activeCompound, registry, "structured") });
       } catch (err) {
         if (!steps.length) throw err;
         decision = { type: "final", text: summarizeSteps(steps, "ai_unavailable") };
@@ -910,22 +1090,109 @@ export async function runAgent({
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       const id = call.id || `call_${iterations}_${i}`;
-      let parsedArguments;
-      let result;
-      if (i >= limits.MAX_CALLS_PER_ITERATION) {
-        result = { ok: false, rejected: true, error: `Too many tool calls in one turn (max ${limits.MAX_CALLS_PER_ITERATION}).` };
-      } else {
-        ({ parsedArguments, result } = await executeCall(call));
+      let parsedArguments = call.arguments;
+
+      if (parsedArguments === undefined && typeof call.rawArguments === "string") {
+        try {
+          parsedArguments = call.rawArguments.trim() ? JSON.parse(call.rawArguments) : {};
+        } catch {
+          parsedArguments = undefined;
+        }
       }
-      steps.push({
-        turn: iterations,
-        id,
-        name: call.name,
-        rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(call.arguments ?? {}),
-        parsedArguments,
-        assistantContent: decision.content || "",
-        result,
-      });
+
+      const tool = registry.get(call.name);
+
+      // Check if this is a client-side tool
+      if (tool && tool.runtime === "client") {
+        if (parsedArguments === undefined) {
+          const result = { ok: false, rejected: true, error: "Tool arguments were not valid JSON." };
+          steps.push({
+            turn: iterations,
+            id,
+            name: call.name,
+            rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : "{}",
+            parsedArguments,
+            assistantContent: decision.content || "",
+            result,
+          });
+          trace.push({
+            name: String(call.name || "").slice(0, 60),
+            arguments: parsedArguments ?? "{}",
+            ok: false,
+            rejected: true,
+            error: result.error,
+            provenance: "client_editor_bridge",
+            durationMs: 0,
+          });
+        } else {
+          const v = validateArgs(tool.parameters, parsedArguments);
+          if (!v.ok) {
+            const result = { ok: false, rejected: true, error: `Invalid arguments: ${v.error}` };
+            steps.push({
+              turn: iterations,
+              id,
+              name: call.name,
+              rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(parsedArguments),
+              parsedArguments,
+              assistantContent: decision.content || "",
+              result,
+            });
+            trace.push({
+              name: String(call.name || "").slice(0, 60),
+              arguments: parsedArguments,
+              ok: false,
+              rejected: true,
+              error: result.error,
+              provenance: "client_editor_bridge",
+              durationMs: 0,
+            });
+          } else {
+            // Client tool validated! Pause execution and request action from client
+            return {
+              status: "action_required",
+              actionRequest: {
+                id,
+                tool: tool.name,
+                arguments: v.value,
+              },
+              continuationToken: createContinuationToken({
+                sessionId: activeSessionId,
+                message: userMessage,
+                compound: activeCompound,
+                history: convHistory,
+                steps,
+                trace,
+                pendingCall: {
+                  id,
+                  name: tool.name,
+                  rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(v.value),
+                  parsedArguments: v.value,
+                  assistantContent: decision.content || "",
+                },
+                iterations,
+                mode,
+                started,
+              }),
+            };
+          }
+        }
+      } else {
+        let result;
+        if (i >= limits.MAX_CALLS_PER_ITERATION) {
+          result = { ok: false, rejected: true, error: `Too many tool calls in one turn (max ${limits.MAX_CALLS_PER_ITERATION}).` };
+        } else {
+          ({ parsedArguments, result } = await executeCall(call));
+        }
+        steps.push({
+          turn: iterations,
+          id,
+          name: call.name,
+          rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(call.arguments ?? {}),
+          parsedArguments,
+          assistantContent: decision.content || "",
+          result,
+        });
+      }
     }
   }
 

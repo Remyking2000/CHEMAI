@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
 import { API_ROUTES } from "../config/api";
+import { sendAgentChat } from "../lib/agentHandshake";
 
 // Curated compound presets for testing compound-focused context
 const PRESET_COMPOUNDS = [
@@ -118,6 +119,7 @@ export default function Chat() {
   const [showMobileContext, setShowMobileContext] = useState(false);
   const [showPresetPicker, setShowPresetPicker] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [agentStatus, setAgentStatus] = useState("");
   const [, setApiError] = useState(null);
 
   const messagesEndRef = useRef(null);
@@ -181,43 +183,42 @@ export default function Chat() {
     setMessages((prev) => [...prev, userMessage]);
     setInputValue("");
     setLoading(true);
+    setAgentStatus("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
 
-    const payload = {
-      message: trimmed,
-      history: currentHistory,
-      compound: activeCompound
-        ? {
-            name: activeCompound.name,
-            formula: activeCompound.formula,
-            weight: activeCompound.weight,
-            cid: activeCompound.cid,
-            smiles: activeCompound.smiles,
-            iupac: activeCompound.iupac,
-            category: activeCompound.category,
-            description: activeCompound.description,
-            casNumber: activeCompound.casNumber,
-          }
-        : null,
-    };
-
     try {
-      const res = await fetch(API_ROUTES.chat, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      const data = await sendAgentChat({
+        message: trimmed,
+        history: currentHistory,
+        compound: activeCompound
+          ? {
+              name: activeCompound.name,
+              formula: activeCompound.formula,
+              weight: activeCompound.weight,
+              cid: activeCompound.cid,
+              smiles: activeCompound.smiles,
+              iupac: activeCompound.iupac,
+              category: activeCompound.category,
+              description: activeCompound.description,
+              casNumber: activeCompound.casNumber,
+            }
+          : null,
+        onStatusChange: (s) => {
+          if (s.status === "executing_action") {
+            const toolLabels = {
+              read_editor_structure: "Inspecting molecular editor canvas...",
+              load_structure_into_editor: "Loading structure into molecular editor...",
+              fit_canvas_view: "Centering and fitting canvas view...",
+              get_editor_capabilities: "Checking molecular editor capabilities...",
+            };
+            setAgentStatus(toolLabels[s.action?.tool] || `Executing editor operation: ${s.action?.tool}...`);
+          } else {
+            setAgentStatus("");
+          }
         },
-        body: JSON.stringify(payload),
       });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        const errorDetail = data.details ? ` (${data.details})` : "";
-        throw new Error(data.error ? `${data.error}${errorDetail}` : `Server returned status ${res.status}`);
-      }
 
       const assistantMessage = {
         id: `assistant-${Date.now()}`,
@@ -857,12 +858,12 @@ export default function Chat() {
                   <div className="max-w-[85%] sm:max-w-[80%] rounded-2xl p-4 bg-slate-900/95 border border-cyan-500/30 text-slate-200 shadow-md rounded-tl-none space-y-2">
                     <div className="flex items-center justify-between text-[10px] text-cyan-400 pb-1 border-b border-white/5">
                       <span className="font-bold uppercase tracking-wider">ChemAI Assistant</span>
-                      <span className="animate-pulse">Reasoning...</span>
+                      <span className="animate-pulse">{agentStatus || "Reasoning..."}</span>
                     </div>
                     <div className="flex items-center gap-2 text-xs text-slate-300">
                       <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
                       <span>
-                        Formulating chemistry response{selectedCompound ? ` on ${selectedCompound.name}` : ""}...
+                        {agentStatus || `Formulating chemistry response${selectedCompound ? ` on ${selectedCompound.name}` : ""}...`}
                       </span>
                     </div>
                     <div className="flex items-center gap-1.5 pt-1">

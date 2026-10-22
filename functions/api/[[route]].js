@@ -563,8 +563,10 @@ async function handleChat(request, env) {
   let history = Array.isArray(body.history) ? body.history : [];
   const compound = body.compound && typeof body.compound === "object" ? body.compound : null;
   const sessionId = body.sessionId || null;
+  const continuationToken = body.continuationToken || null;
+  const clientActionResult = body.clientActionResult || null;
 
-  if (!message) {
+  if (!message && !continuationToken) {
     return jsonResponse({ error: "Message is required." }, 400);
   }
 
@@ -577,7 +579,7 @@ async function handleChat(request, env) {
 
   // Agent path (default). Set CHAT_AGENT_ENABLED="false" to use the legacy direct chat.
   if (String(env.CHAT_AGENT_ENABLED ?? "true").toLowerCase() !== "false") {
-    if (!history.length && sessionId) {
+    if (!history.length && sessionId && !continuationToken) {
       history = await loadSessionHistory(env, sessionId);
     }
 
@@ -587,6 +589,9 @@ async function handleChat(request, env) {
         message,
         history,
         compound,
+        sessionId,
+        continuationToken,
+        clientActionResult,
         env,
         registry: agentToolRegistry,
         callAI,
@@ -597,6 +602,14 @@ async function handleChat(request, env) {
         { error: "ChemAI agent could not complete the request.", details: sanitizeError(err?.message) },
         502
       );
+    }
+
+    if (agentResult?.status === "action_required") {
+      return jsonResponse({
+        status: "action_required",
+        actionRequest: agentResult.actionRequest,
+        continuationToken: agentResult.continuationToken,
+      });
     }
 
     await persistChatTurn(env, sessionId, compound, message, agentResult);

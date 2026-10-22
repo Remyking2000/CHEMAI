@@ -4,7 +4,11 @@
  * - In local development: Vite proxies /api to http://localhost:5000 automatically,
  *   or honors VITE_API_URL if explicitly specified.
  */
-export const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+export const API_BASE = (
+  (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) ||
+  (typeof globalThis !== "undefined" && globalThis.process?.env?.VITE_API_URL) ||
+  ""
+).replace(/\/$/, "");
 
 export const API_ROUTES = {
   health: `${API_BASE}/api/health`,
