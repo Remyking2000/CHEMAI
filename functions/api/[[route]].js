@@ -817,6 +817,16 @@ async function handleGetHistory(request, env, url) {
  * AI CLIENT GATEWAY (OpenRouter / Gemini / Cloudflare AI / Keyless Edge Fallback)
  * -----------------------------------------------------------------------------
  */
+async function fetchWithTimeout(url, options, timeoutMs = 10000) {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    return await fetch(url, controller ? { ...options, signal: controller.signal } : options);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function callAI({ prompt, history = [], systemPrompt = "", env }) {
   const openRouterKey = typeof env.OPENROUTER_API_KEY === "string" ? env.OPENROUTER_API_KEY.trim() : "";
   const geminiKey = typeof env.GEMINI_API_KEY === "string" ? env.GEMINI_API_KEY.trim() : "";
@@ -862,11 +872,15 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
 
       contents.push({ role: "user", parts: [{ text: prompt }] });
 
-      const gRes = await fetch(geminiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents }),
-      });
+      const gRes = await fetchWithTimeout(
+        geminiUrl,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents }),
+        },
+        10000
+      );
 
       if (gRes.ok) {
         const gData = await gRes.json();
@@ -883,26 +897,33 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
   // 2. Route to OpenRouter API if key is configured
   if (hasValidOpenRouter) {
     const primaryModel = env.OPENROUTER_MODEL || "liquid/lfm-2.5-2.6b:free";
-    const modelsToTry = [primaryModel, "liquid/lfm-2.5-2.6b:free", "openrouter/free"].filter(
-      (v, i, a) => a.indexOf(v) === i
-    );
+    const modelsToTry = [
+      primaryModel,
+      "liquid/lfm-2.5-2.6b:free",
+      "nvidia/nemotron-3.5-lightning:free",
+      "openrouter/free",
+    ].filter((v, i, a) => a.indexOf(v) === i);
 
     for (const model of modelsToTry) {
       try {
-        const oRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${openRouterKey}`,
-            "HTTP-Referer": "https://chemai.ycremy2000.workers.dev",
-            "X-Title": "ChemAI Lab Suite",
+        const oRes = await fetchWithTimeout(
+          "https://openrouter.ai/api/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${openRouterKey}`,
+              "HTTP-Referer": "https://chemai.ycremy2000.workers.dev",
+              "X-Title": "ChemAI Lab Suite",
+            },
+            body: JSON.stringify({
+              model,
+              messages,
+              temperature: 0.2,
+            }),
           },
-          body: JSON.stringify({
-            model,
-            messages,
-            temperature: 0.2,
-          }),
-        });
+          10000
+        );
 
         if (oRes.ok) {
           const oData = await oRes.json();
@@ -946,19 +967,23 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
 
   // 4. Keyless Edge LLM Fallback (with User-Agent and seed for reliable completion)
   try {
-    const pRes = await fetch("https://text.pollinations.ai/openai", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "ChemAI-Lab-Suite/1.0",
+    const pRes = await fetchWithTimeout(
+      "https://text.pollinations.ai/openai",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "ChemAI-Lab-Suite/1.0",
+        },
+        body: JSON.stringify({
+          model: "openai",
+          seed: Math.floor(Math.random() * 100000),
+          messages,
+          temperature: 0.2,
+        }),
       },
-      body: JSON.stringify({
-        model: "openai",
-        seed: Math.floor(Math.random() * 100000),
-        messages,
-        temperature: 0.2,
-      }),
-    });
+      8000
+    );
 
     if (pRes.ok) {
       const pData = await pRes.json();

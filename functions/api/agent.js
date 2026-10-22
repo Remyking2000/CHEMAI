@@ -547,7 +547,12 @@ function openRouterKey(env) {
 
 function openRouterModels(env) {
   const primary = env?.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL;
-  return [primary, DEFAULT_OPENROUTER_MODEL, "openrouter/free"].filter((v, i, a) => a.indexOf(v) === i);
+  return [
+    primary,
+    DEFAULT_OPENROUTER_MODEL,
+    "nvidia/nemotron-3.5-lightning:free",
+    "openrouter/free",
+  ].filter((v, i, a) => a.indexOf(v) === i);
 }
 
 /** Inspects OpenRouter model endpoints for `tools` support. Returns true/false/null (unknown). */
@@ -823,10 +828,7 @@ export async function runAgent({
           result = { ...resultCache.get(sig), note: "Duplicate call; returning the earlier result." };
         } else {
           try {
-            const remaining = Math.max(
-              1000,
-              Math.min(limits.TOOL_TIMEOUT_MS, deadline - now() - limits.FINAL_ANSWER_RESERVE_MS)
-            );
+            const remaining = Math.max(1000, Math.min(limits.TOOL_TIMEOUT_MS, deadline - now()));
             result = await withTimeout(tool.execute(v.value, ctx), remaining, `Tool ${tool.name}`);
           } catch (err) {
             result = { ok: false, error: sanitizeText(err?.message || "Tool execution failed.") };
