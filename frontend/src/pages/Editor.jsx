@@ -23,9 +23,6 @@ export default function MolecularEditor() {
   const moleculeManager = useMoleculeManager(null, location.state?.loadSmiles);
   const isEditorReady = true;
 
-  // Exported structure data
-  const [exportData, setExportData] = useState(null);
-  const [exportLoading, setExportLoading] = useState(false);
   const [copiedField, setCopiedField] = useState(null);
 
   // Phase 1B: Chemical Identification state
@@ -300,40 +297,9 @@ export default function MolecularEditor() {
     });
   };
 
-  // Export current molecular structure
-  const handleExportStructure = async () => {
-    setExportLoading(true);
-    try {
-      const { smiles, molfile, atomCount, bondCount, formula, weight } = await getCurrentStructure();
-      const isEmpty = (!molfile || !molfile.trim() || atomCount === 0) && (!smiles || !smiles.trim());
-
-      if (isEmpty) {
-        showStatus("Canvas is empty. Draw a molecule first to export its structure.");
-        setExportData(null);
-      } else {
-        setExportData({
-          smiles: smiles || "N/A",
-          molfile: molfile || "",
-          formula: formula || "—",
-          molecularWeight: weight || "—",
-          atomCount,
-          bondCount,
-          timestamp: new Date().toLocaleTimeString(),
-        });
-        showStatus("Structure successfully exported!");
-      }
-    } catch (err) {
-      console.error("Failed to export structure:", err);
-      showStatus(`Error exporting structure: ${err?.message || err}`);
-    } finally {
-      setExportLoading(false);
-    }
-  };
-
   // Clear current molecular structure
   const handleClearStructure = async () => {
     moleculeManager.clear();
-    setExportData(null);
     setIdentifyResult(null);
     setIdentifyError(null);
     setExplainResult(null);
@@ -350,9 +316,6 @@ export default function MolecularEditor() {
 
     moleculeManager.loadSmiles(smiles);
     showStatus(`Loaded ${name} onto canvas.`);
-    if (exportData) {
-      setTimeout(handleExportStructure, 300);
-    }
   };
 
   // Copy text to clipboard helper
@@ -361,20 +324,6 @@ export default function MolecularEditor() {
     navigator.clipboard.writeText(text);
     setCopiedField(field);
     setTimeout(() => setCopiedField(null), 2000);
-  };
-
-  // Download Molfile as .mol
-  const handleDownloadMol = () => {
-    if (!exportData?.molfile) return;
-    const blob = new Blob([exportData.molfile], { type: "chemical/x-mdl-molfile" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `chemai_structure_${Date.now()}.mol`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
   };
 
   // Preserved Compound Analyzer function (calls backend /api/analyze)
@@ -594,7 +543,6 @@ export default function MolecularEditor() {
       setIdentifyError(null);
       setExplainResult(null);
       setExplainError(null);
-      setExportData(null);
 
       setSelectedCandidateCid(candidate.cid);
       moleculeManager.loadSmiles(candidate.smiles);
@@ -748,7 +696,6 @@ export default function MolecularEditor() {
       setIdentifyError(null);
       setExplainResult(null);
       setExplainError(null);
-      setExportData(null);
 
       setAiApproved(true);
       moleculeManager.loadSmiles(aiCandidate.smiles);
@@ -1039,23 +986,6 @@ export default function MolecularEditor() {
                 title="Clear all atoms and bonds from canvas"
               >
                 <span>✕</span> Clear
-              </button>
-
-              {/* Export Structure */}
-              <button
-                type="button"
-                onClick={handleExportStructure}
-                disabled={!isEditorReady || exportLoading}
-                className="px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 hover:text-blue-700 rounded border border-gray-200 disabled:opacity-50 transition-colors flex items-center gap-1 shadow-2xs cursor-pointer"
-                title="Export structure as SMILES and Molfile"
-              >
-                {exportLoading ? (
-                  <span>⏳ Exporting...</span>
-                ) : (
-                  <>
-                    <span>📤</span> Export
-                  </>
-                )}
               </button>
             </div>
 
@@ -2120,18 +2050,6 @@ export default function MolecularEditor() {
                   {sample.name}
                 </button>
               ))}
-
-              <span className="w-px h-4 bg-slate-200 mx-1" />
-
-              <button
-                type="button"
-                onClick={handleExportStructure}
-                disabled={exportLoading}
-                className="px-2.5 py-1 text-xs font-semibold text-slate-700 bg-slate-50 hover:bg-slate-100 rounded-lg border border-slate-200 transition-colors cursor-pointer"
-                title="Export structure as SMILES and Molfile"
-              >
-                📤 Export Structure
-              </button>
             </div>
           </div>
 
@@ -2155,108 +2073,6 @@ export default function MolecularEditor() {
             onSwitchToMobile={handleSwitchToMobile}
           />
         </div>
-
-        {/* Export Structure Results Panel */}
-        {exportData && (
-          <div className="bg-white rounded-xl shadow-sm border border-emerald-200 overflow-hidden">
-            <div className="bg-emerald-50/80 px-6 py-3 border-b border-emerald-200 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="text-emerald-700 font-bold text-base">
-                  Exported Structure
-                </span>
-                <span className="text-xs text-emerald-600 bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
-                  Generated at {exportData.timestamp}
-                </span>
-              </div>
-              <button
-                onClick={() => setExportData(null)}
-                className="text-gray-400 hover:text-gray-600 text-sm px-2 py-1 cursor-pointer"
-                title="Dismiss export panel"
-              >
-                ✕ Close
-              </button>
-            </div>
-
-            <div className="p-6 space-y-6">
-              {/* Chemical Summary Cards */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                  <span className="text-xs text-gray-500 uppercase font-semibold">Formula</span>
-                  <p className="text-lg font-bold text-gray-900 mt-0.5 font-mono">
-                    {exportData.formula}
-                  </p>
-                </div>
-                <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                  <span className="text-xs text-gray-500 uppercase font-semibold">Mol Weight</span>
-                  <p className="text-lg font-bold text-gray-900 mt-0.5 font-mono">
-                    {exportData.molecularWeight ? `${exportData.molecularWeight} g/mol` : "—"}
-                  </p>
-                </div>
-                <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                  <span className="text-xs text-gray-500 uppercase font-semibold">Atoms</span>
-                  <p className="text-lg font-bold text-gray-900 mt-0.5">
-                    {exportData.atomCount}
-                  </p>
-                </div>
-                <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                  <span className="text-xs text-gray-500 uppercase font-semibold">Bonds</span>
-                  <p className="text-lg font-bold text-gray-900 mt-0.5">
-                    {exportData.bondCount}
-                  </p>
-                </div>
-              </div>
-
-              {/* SMILES Representation */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-xs font-bold text-gray-700 uppercase tracking-wider">
-                    SMILES Notation (Machine-Readable)
-                  </label>
-                  <button
-                    onClick={() => handleCopy(exportData.smiles, "smiles")}
-                    className="text-xs text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1 cursor-pointer"
-                  >
-                    {copiedField === "smiles" ? "✓ Copied SMILES" : "📋 Copy SMILES"}
-                  </button>
-                </div>
-                <div className="relative">
-                  <input
-                    type="text"
-                    readOnly
-                    value={exportData.smiles}
-                    className="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-300 rounded-lg font-mono text-sm text-gray-900 select-all focus:outline-none"
-                  />
-                </div>
-              </div>
-
-              {/* Molfile (MDL V2000) Representation */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-xs font-bold text-gray-700 uppercase tracking-wider">
-                    Molfile (MDL Molfile V2000)
-                  </label>
-                  <div className="flex items-center gap-3">
-                    <button
-                      onClick={() => handleCopy(exportData.molfile, "molfile")}
-                      className="text-xs text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1 cursor-pointer"
-                    >
-                      {copiedField === "molfile" ? "✓ Copied Molfile" : "📋 Copy Molfile"}
-                    </button>
-                    <button
-                      onClick={handleDownloadMol}
-                      className="text-xs text-emerald-600 hover:text-emerald-800 font-medium flex items-center gap-1 cursor-pointer"
-                    >
-                      💾 Download .mol
-                    </button>
-                  </div>
-                </div>
-                <pre className="bg-gray-900 text-emerald-400 p-4 rounded-lg font-mono text-xs overflow-x-auto max-h-56 overflow-y-auto leading-relaxed border border-gray-800 select-all">
-                  {exportData.molfile}
-                </pre>
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* Preserved Compound Analyzer Panel (PubChem Search & Backend Integration) */}
         {showAnalyzer && (
