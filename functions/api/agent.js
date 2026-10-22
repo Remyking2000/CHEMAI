@@ -33,7 +33,9 @@ export const AGENT_LIMITS = Object.freeze({
   MODEL_TIMEOUT_MS: 25000,
   TOOL_TIMEOUT_MS: 20000,
   CAPABILITY_TIMEOUT_MS: 4000,
-  TOTAL_BUDGET_MS: 60000,
+  TOTAL_BUDGET_MS: 60000, // hard wall-clock budget for the whole request
+  FINAL_ANSWER_RESERVE_MS: 15000, // stop starting new tool rounds when less than this remains
+  MIN_MODEL_CALL_MS: 3000, // do not start a model call with less time than this
 });
 
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
@@ -607,15 +609,18 @@ function buildNativeMessages({ systemPrompt, history, message, steps, forceFinal
   return messages;
 }
 
-async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, message, steps, forceFinal, now }) {
+async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, message, steps, forceFinal, now, deadline, limits }) {
   const key = openRouterKey(env);
   if (!key) return null;
   const tools = toOpenAITools(registry);
   const messages = buildNativeMessages({ systemPrompt, history, message, steps, forceFinal });
 
   for (const model of openRouterModels(env)) {
+    if (deadline - now() < limits.MIN_MODEL_CALL_MS) return { type: "budget_exhausted" };
     const supported = await getToolSupport(model, env, fetchImpl, now);
     if (supported === false) continue;
+    const callTimeout = Math.min(limits.MODEL_TIMEOUT_MS, deadline - now());
+    if (callTimeout < limits.MIN_MODEL_CALL_MS) return { type: "budget_exhausted" };
     try {
       const res = await fetchWithTimeout(
         fetchImpl,
@@ -637,7 +642,7 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
             max_tokens: 1800,
           }),
         },
-        AGENT_LIMITS.MODEL_TIMEOUT_MS
+        callTimeout
       );
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
@@ -676,7 +681,9 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
 /* Structured fallback adapter (uses the existing callAI gateway)             */
 /* -------------------------------------------------------------------------- */
 
-async function structuredNext({ env, callAI, systemPrompt, history, message, steps, forceFinal }) {
+async function structuredNext({ env, callAI, systemPrompt, history, message, steps, forceFinal, now, deadline, limits }) {
+  const remaining = deadline - now();
+  if (remaining < limits.MIN_MODEL_CALL_MS) return { type: "budget_exhausted" };
   const convo = [...history];
   let prompt = message;
   if (steps.length) {
@@ -697,7 +704,7 @@ async function structuredNext({ env, callAI, systemPrompt, history, message, ste
 
   const ai = await withTimeout(
     callAI({ prompt, history: convo, systemPrompt, env }),
-    AGENT_LIMITS.MODEL_TIMEOUT_MS * 2,
+    remaining,
     "AI provider"
   );
   // The deterministic last-resort responder cannot reason over tool results.
@@ -816,7 +823,10 @@ export async function runAgent({
           result = { ...resultCache.get(sig), note: "Duplicate call; returning the earlier result." };
         } else {
           try {
-            const remaining = Math.max(1000, Math.min(limits.TOOL_TIMEOUT_MS, deadline - now()));
+            const remaining = Math.max(
+              1000,
+              Math.min(limits.TOOL_TIMEOUT_MS, deadline - now() - limits.FINAL_ANSWER_RESERVE_MS)
+            );
             result = await withTimeout(tool.execute(v.value, ctx), remaining, `Tool ${tool.name}`);
           } catch (err) {
             result = { ok: false, error: sanitizeText(err?.message || "Tool execution failed.") };
@@ -843,9 +853,10 @@ export async function runAgent({
   };
 
   while (reply === null) {
-    const outOfTime = now() >= deadline;
+    // Stop opening new tool rounds once only the final-answer reserve remains.
+    const outOfTime = steps.length > 0 && deadline - now() < limits.FINAL_ANSWER_RESERVE_MS;
     const forceFinal = iterations >= limits.MAX_TOOL_ITERATIONS || outOfTime;
-    const shared = { env, fetchImpl, registry, history: convHistory, message: userMessage, steps, forceFinal, now, callAI };
+    const shared = { env, fetchImpl, registry, history: convHistory, message: userMessage, steps, forceFinal, now, callAI, deadline, limits };
 
     let decision = null;
     if (mode === "native") {
@@ -859,6 +870,13 @@ export async function runAgent({
         if (!steps.length) throw err;
         decision = { type: "final", text: summarizeSteps(steps, "ai_unavailable") };
       }
+    }
+
+    if (decision.type === "budget_exhausted") {
+      if (!steps.length) throw new Error("The AI model did not respond within the time limit. Please try again.");
+      reply = summarizeSteps(steps, "time_budget");
+      stopReason = "time_budget";
+      break;
     }
 
     provider = decision.provider || provider;

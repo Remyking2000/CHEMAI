@@ -217,6 +217,31 @@ console.log("--- Starting ChemAI Agent Core Tests ---");
   assert(res.agent.stopReason === "iteration_limit" && /tool-use limit/.test(res.reply) && /Unresolved/.test(res.reply), "Reply explains what was completed and what is unresolved");
 }
 
+/* 6b. Wall-clock budget enforced (fake clock: each model call costs 10 s) */
+{
+  _resetCapabilityCache();
+  let clock = 0;
+  const now = () => clock;
+  const { handlers } = mockHandlers();
+  const base = mockOpenRouter((body) => (body.tool_choice === "none" ? { content: "Partial answer within budget." } : toolCall(`t${clock}`, "lookup_structure", { query: `q${clock}` })));
+  const fetchImpl = async (url, opts) => {
+    if (String(url).includes("/chat/completions")) clock += 10000;
+    return base.fetchImpl(url, opts);
+  };
+  const limits = { ...AGENT_LIMITS, TOTAL_BUDGET_MS: 30000, FINAL_ANSWER_RESERVE_MS: 15000 };
+  const res = await runAgent({ message: "slow", env: ENV, registry: createToolRegistry(handlers), callAI: noCallAI, fetchImpl, now, limits });
+  assert(res.agent.iterations === 2 && res.agent.stopReason === "time_budget", "Time budget stops new tool rounds and forces a final answer");
+  assert(base.requests.at(-1).tool_choice === "none" && res.reply === "Partial answer within budget.", "Forced final turn still lets the model answer within the reserve");
+
+  let threw = false;
+  try {
+    await runAgent({ message: "x", env: ENV, registry: createToolRegistry(handlers), callAI: noCallAI, fetchImpl: base.fetchImpl, now: () => 0, limits: { ...AGENT_LIMITS, TOTAL_BUDGET_MS: 1000 } });
+  } catch (e) {
+    threw = /time limit/.test(e.message);
+  }
+  assert(threw, "No model call is started without enough remaining budget; a clear error is raised");
+}
+
 /* 7. Compound context and conversation history preserved */
 {
   _resetCapabilityCache();
