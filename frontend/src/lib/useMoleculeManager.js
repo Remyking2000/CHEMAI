@@ -4,7 +4,6 @@ import {
   molFromSmiles,
   molFromMolfile,
   exportStructure,
-  placeRing,
   reseedIds,
 } from "./moleculeEngine";
 
@@ -26,12 +25,8 @@ export function useMoleculeManager(initialMol = null, initialSmiles = null) {
         console.warn("Could not parse initialSmiles in useMoleculeManager:", e);
       }
     }
-    // Default starter structure: Benzene ring
-    try {
-      return placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true);
-    } catch {
-      return EMPTY_MOL;
-    }
+    // Start with a clean, empty canvas by default
+    return EMPTY_MOL;
   });
 
   const molRef = useRef(mol);

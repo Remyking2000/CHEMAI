@@ -74,12 +74,8 @@ export default function DesktopMolecularEditor({
         console.warn("Could not parse initialSmiles for desktop editor:", e);
       }
     }
-    // Default starter structure: Benzene ring
-    try {
-      return placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true);
-    } catch {
-      return EMPTY_MOL;
-    }
+    // Start with a clean, empty canvas by default
+    return EMPTY_MOL;
   });
 
   const [internalHistory, setInternalHistory] = useState({ past: [], future: [] });
@@ -154,7 +150,7 @@ export default function DesktopMolecularEditor({
   // 2. Editor Tools & Configuration State
   // ---------------------------------------------------------------------------
   // Active tool: 'select' | 'bond' | 'ring' | 'erase' | 'charge'
-  const [activeTool, setActiveTool] = useState("select");
+  const [activeTool, setActiveTool] = useState("bond");
   const [currentElement, setCurrentElement] = useState("C");
   const [currentBondOrder, setCurrentBondOrder] = useState(1);
   const [currentRing, setCurrentRing] = useState({ size: 6, aromatic: true, name: "Benzene" });
@@ -1574,57 +1570,10 @@ export default function DesktopMolecularEditor({
             </g>
           </svg>
 
-          {/* Empty Canvas Quick-Start Guide */}
+          {/* Subtle non-blocking empty canvas hint */}
           {currentMol.atoms.length === 0 && (
-            <div className="absolute top-6 left-6 max-w-sm bg-white/95 border border-slate-200 rounded-2xl p-4 shadow-lg backdrop-blur-sm pointer-events-auto z-10 animate-in fade-in">
-              <div className="flex items-start gap-3">
-                <div className="w-9 h-9 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-600 flex items-center justify-center text-lg font-bold shrink-0">
-                  ✏️
-                </div>
-                <div>
-                  <h4 className="text-sm font-bold text-slate-800">Start Drawing Structure</h4>
-                  <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
-                    Click to place an atom or drag to create a bond. Pick an element or template from the toolbar to begin.
-                  </p>
-                  <div className="flex flex-wrap gap-1.5 mt-3">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const { mol: nextM } = addAtom(EMPTY_MOL, -20, 0, "C");
-                        const { mol: chainM } = addAtom(nextM, 20, 0, "C");
-                        const chained = addBond(chainM, chainM.atoms[0].id, chainM.atoms[1].id, 1);
-                        pushState(chained, false);
-                        fitMoleculeToViewport(chained, dimensionsRef.current);
-                      }}
-                      className="px-2.5 py-1 text-xs font-semibold bg-slate-100 hover:bg-slate-200 rounded-lg text-slate-700 transition-colors cursor-pointer"
-                    >
-                      C—C Chain
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const ringMol = placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, true);
-                        pushState(ringMol, false);
-                        fitMoleculeToViewport(ringMol, dimensionsRef.current);
-                      }}
-                      className="px-2.5 py-1 text-xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg transition-colors cursor-pointer"
-                    >
-                      ⬡ Benzene
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const ringMol = placeRing(EMPTY_MOL, 6, { type: "point", x: 0, y: 0 }, false);
-                        pushState(ringMol, false);
-                        fitMoleculeToViewport(ringMol, dimensionsRef.current);
-                      }}
-                      className="px-2.5 py-1 text-xs font-semibold bg-slate-100 hover:bg-slate-200 rounded-lg text-slate-700 transition-colors cursor-pointer"
-                    >
-                      ⬡ Cyclohexane
-                    </button>
-                  </div>
-                </div>
-              </div>
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white/85 border border-slate-200/80 rounded-full px-4 py-1.5 shadow-xs backdrop-blur-xs pointer-events-none z-10 text-xs text-slate-500 font-medium">
+              Click or drag anywhere on the canvas to draw
             </div>
           )}
 

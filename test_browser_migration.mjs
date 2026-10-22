@@ -109,13 +109,13 @@ async function run() {
     console.log("Desktop SVG canvas exists:", hasSvg);
     if (!hasSvg) throw new Error("Desktop SVG canvas not found!");
 
-    // 4. Verify initial Benzene structure rendered (Formula C6H6)
+    // 4. Verify initial canvas is empty (Formula None)
     const formulaText = await client.eval(`
       Array.from(document.querySelectorAll("#desktop-canvas-card span, #desktop-canvas-card div"))
-        .find(el => el.textContent.trim() === "C6H6") ? "C6H6" : "NOT_FOUND"
+        .find(el => el.textContent.trim() === "None") ? "None" : "NOT_FOUND"
     `);
-    console.log("Initial structure formula check:", formulaText);
-    if (formulaText !== "C6H6") throw new Error("Initial Benzene formula not found on canvas!");
+    console.log("Initial empty canvas check:", formulaText);
+    if (formulaText !== "None") throw new Error("Initial canvas should be empty (Formula: None)!");
 
     // 5. Test Sample Structure loading: Click 'Aspirin' or 'Ethanol'
     console.log("Clicking 'Ethanol' sample button...");
