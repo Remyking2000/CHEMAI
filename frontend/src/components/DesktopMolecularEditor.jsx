@@ -9,7 +9,6 @@ import {
   findAtomNear,
   findBondNear,
   addAtom,
-  addBond,
   setBondOrder,
   setAtomElement,
   removeAtom,
