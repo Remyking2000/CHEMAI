@@ -537,11 +537,18 @@ export default function DesktopMolecularEditor({
         return;
       }
 
-      // Escape: deselect or cancel
+      // Escape: deselect all canvas items, compound tools, and element overrides
       if (e.key === "Escape") {
         setSelectedAtomIds(new Set());
         setSelectedBondIds(new Set());
-        if (activeTool !== "select") setActiveTool("select");
+        if (activeTool !== "bond") {
+          setActiveTool("bond");
+          showToast("Deselected tool");
+        }
+        if (currentElement !== "C") {
+          setCurrentElement("C");
+          showToast("Deselected element (reverted to C)");
+        }
         return;
       }
 
@@ -586,6 +593,7 @@ export default function DesktopMolecularEditor({
     currentMol,
     pushState,
     activeTool,
+    currentElement,
     handleZoomIn,
     handleZoomOut,
     handleFitToScreen,
@@ -681,6 +689,8 @@ export default function DesktopMolecularEditor({
           pushState(next);
           showToast(`Placed ${currentRing.name} ring`);
         }
+        // Auto-deselect compound back to draw/bond tool
+        setActiveTool("bond");
         return;
       }
 
@@ -956,7 +966,20 @@ export default function DesktopMolecularEditor({
           {/* Select / Move Tool */}
           <button
             type="button"
-            onClick={() => setActiveTool("select")}
+            onClick={() => {
+              if (activeTool === "select") {
+                if (selectedAtomIds.size > 0 || selectedBondIds.size > 0) {
+                  setSelectedAtomIds(new Set());
+                  setSelectedBondIds(new Set());
+                  showToast("Deselected selection");
+                } else {
+                  setActiveTool("bond");
+                  showToast("Switched to Draw tool");
+                }
+              } else {
+                setActiveTool("select");
+              }
+            }}
             className={`px-3 py-1.5 rounded-lg font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
               activeTool === "select"
                 ? "bg-indigo-600 text-white shadow-sm"
@@ -990,35 +1013,50 @@ export default function DesktopMolecularEditor({
           {/* Erase Tool */}
           <button
             type="button"
-            onClick={() => setActiveTool("erase")}
+            onClick={() => {
+              if (activeTool === "erase") {
+                setActiveTool("bond");
+                showToast("Deselected Erase tool");
+              } else {
+                setActiveTool("erase");
+                showToast("Erase tool active — click atom or bond to erase");
+              }
+            }}
             className={`px-3 py-1.5 rounded-lg font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
               activeTool === "erase"
                 ? "bg-red-600 text-white shadow-sm"
                 : "bg-white hover:bg-red-50 text-slate-700 hover:text-red-700 border border-slate-200"
             }`}
-            title="Erase atoms and bonds (Shortcut: E)"
+            title={activeTool === "erase" ? "Click to deselect Erase tool" : "Erase atoms and bonds (Shortcut: E)"}
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
             </svg>
             <span>Erase</span>
+            {activeTool === "erase" && <span className="text-3xs bg-white/20 rounded px-1">✕</span>}
           </button>
 
           {/* Charge Tool (+ / -) */}
           <button
             type="button"
             onClick={() => {
-              setActiveTool("charge");
-              setChargeDelta((prev) => (prev === 1 ? -1 : 1));
+              if (activeTool === "charge") {
+                setActiveTool("bond");
+                showToast("Deselected Charge tool");
+              } else {
+                setActiveTool("charge");
+                setChargeDelta((prev) => (prev === 1 ? -1 : 1));
+              }
             }}
             className={`px-2.5 py-1.5 rounded-lg font-bold flex items-center gap-1 transition-colors cursor-pointer ${
               activeTool === "charge"
                 ? "bg-amber-600 text-white shadow-sm"
                 : "bg-white hover:bg-slate-100 text-slate-700 border border-slate-200"
             }`}
-            title={`Formal Charge: Click atom to apply ${chargeDelta > 0 ? "+1" : "-1"} charge`}
+            title={activeTool === "charge" ? "Click to deselect Charge tool" : `Formal Charge: Click atom to apply ${chargeDelta > 0 ? "+1" : "-1"} charge`}
           >
             <span>{chargeDelta > 0 ? "Charge (+)" : "Charge (-)"}</span>
+            {activeTool === "charge" && <span className="text-3xs bg-white/20 rounded px-1">✕</span>}
           </button>
 
           <span className="w-px h-5 bg-slate-300 mx-1" />
@@ -1082,24 +1120,34 @@ export default function DesktopMolecularEditor({
               { size: 5, aromatic: false, name: "Cyclopentane", label: "⬠ 5-Ring" },
               { size: 4, aromatic: false, name: "Cyclobutane", label: "◻ 4-Ring" },
               { size: 3, aromatic: false, name: "Cyclopropane", label: "△ 3-Ring" },
-            ].map((r) => (
-              <button
-                key={r.name}
-                type="button"
-                onClick={() => {
-                  setCurrentRing(r);
-                  setActiveTool("ring");
-                }}
-                className={`px-2 py-1 rounded font-semibold transition-colors cursor-pointer ${
-                  activeTool === "ring" && currentRing.name === r.name
-                    ? "bg-indigo-100 text-indigo-800"
-                    : "text-slate-600 hover:bg-slate-100"
-                }`}
-                title={`Insert ${r.name} Ring Template`}
-              >
-                {r.label}
-              </button>
-            ))}
+            ].map((r) => {
+              const isRingActive = activeTool === "ring" && currentRing.name === r.name;
+              return (
+                <button
+                  key={r.name}
+                  type="button"
+                  onClick={() => {
+                    if (isRingActive) {
+                      setActiveTool("bond");
+                      showToast(`Deselected ${r.name}`);
+                    } else {
+                      setCurrentRing(r);
+                      setActiveTool("ring");
+                      showToast(`Selected ${r.name} — click canvas to place, or click again to deselect`);
+                    }
+                  }}
+                  className={`px-2 py-1 rounded font-semibold transition-colors cursor-pointer flex items-center gap-1 ${
+                    isRingActive
+                      ? "bg-indigo-600 text-white shadow-xs"
+                      : "text-slate-600 hover:bg-slate-100"
+                  }`}
+                  title={isRingActive ? `Click to deselect ${r.name}` : `Insert ${r.name} Ring Template`}
+                >
+                  <span>{r.label}</span>
+                  {isRingActive && <span className="text-3xs bg-white/20 rounded px-1">✕</span>}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -1249,6 +1297,25 @@ export default function DesktopMolecularEditor({
             Atoms
           </span>
 
+          {/* Custom element badge if picked from periodic table (e.g. Boron "B", etc.) */}
+          {!COMMON_ELEMENTS.includes(currentElement) && (
+            <div className="flex flex-col items-center gap-0.5 w-full pb-1 mb-0.5 border-b border-slate-200">
+              <span className="text-3xs font-bold text-indigo-600 uppercase">Active</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setCurrentElement("C");
+                  showToast(`Deselected ${currentElement} (reverted to C)`);
+                }}
+                className="w-10 h-10 rounded-xl font-bold text-sm bg-indigo-50 shadow-sm border-2 border-indigo-600 scale-105 flex flex-col items-center justify-center text-indigo-800 transition-all cursor-pointer relative"
+                title={`Click to deselect ${currentElement} (revert to C)`}
+              >
+                <span>{currentElement}</span>
+                <span className="text-3xs text-red-500 font-semibold leading-none">✕</span>
+              </button>
+            </div>
+          )}
+
           {COMMON_ELEMENTS.map((el) => {
             const isSelected = currentElement === el;
             const color = ELEMENT_COLORS[el] || "#334155";
@@ -1257,11 +1324,16 @@ export default function DesktopMolecularEditor({
                 key={el}
                 type="button"
                 onClick={() => {
-                  setCurrentElement(el);
-                  if (activeTool !== "bond" && activeTool !== "select") {
-                    setActiveTool("bond");
+                  if (isSelected && el !== "C") {
+                    setCurrentElement("C");
+                    showToast(`Deselected ${el} (reverted to C)`);
+                  } else {
+                    setCurrentElement(el);
+                    if (activeTool !== "bond" && activeTool !== "select") {
+                      setActiveTool("bond");
+                    }
+                    showToast(`Selected element ${el}`);
                   }
-                  showToast(`Selected element ${el}`);
                 }}
                 className={`w-10 h-10 rounded-xl font-bold text-sm flex flex-col items-center justify-center transition-all cursor-pointer ${
                   isSelected
@@ -1269,9 +1341,12 @@ export default function DesktopMolecularEditor({
                     : "bg-white/80 hover:bg-white text-slate-700 border border-slate-200 hover:shadow-xs"
                 }`}
                 style={{ color: isSelected ? color : undefined }}
-                title={`Select ${el} (Shortcut: ${el.toLowerCase()})`}
+                title={isSelected && el !== "C" ? `Click to deselect ${el} (revert to C)` : `Select ${el} (Shortcut: ${el.toLowerCase()})`}
               >
                 <span>{el}</span>
+                {isSelected && el !== "C" && (
+                  <span className="text-3xs text-slate-400 font-normal leading-none -mt-0.5">✕</span>
+                )}
               </button>
             );
           })}
@@ -1296,6 +1371,24 @@ export default function DesktopMolecularEditor({
           {toastMsg && (
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 bg-slate-900/90 text-white text-xs font-medium px-4 py-1.5 rounded-full shadow-lg backdrop-blur-md animate-in fade-in slide-in-from-top-1 pointer-events-none">
               {toastMsg}
+            </div>
+          )}
+
+          {/* Active Compound / Ring Template Banner with 1-click Deselect */}
+          {activeTool === "ring" && (
+            <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 bg-indigo-600 text-white text-xs font-semibold px-4 py-1.5 rounded-full shadow-lg animate-in fade-in slide-in-from-top-1">
+              <span>Compound: <strong>{currentRing.name}</strong> ready to place</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTool("bond");
+                  showToast(`Deselected ${currentRing.name}`);
+                }}
+                className="bg-white/20 hover:bg-white/30 text-white rounded-full px-2 py-0.5 text-2xs transition-colors cursor-pointer"
+                title="Deselect compound template (Escape)"
+              >
+                Deselect (✕)
+              </button>
             </div>
           )}
 

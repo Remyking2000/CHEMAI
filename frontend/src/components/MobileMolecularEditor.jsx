@@ -15,7 +15,6 @@ import {
   setAtomElement,
   removeAtom,
   removeBond,
-  addSubstituent,
   drawBondTo,
   previewBondEnd,
   placeRing,
@@ -596,44 +595,38 @@ export default function MobileMolecularEditor({
         if (selectedAtomId != null && selectedAtomId !== hitAtom.id) {
           const nextM = addBond(molRef.current, selectedAtomId, hitAtom.id, bondOrder);
           pushState(nextM);
-          setSelectedAtomId(hitAtom.id);
+          setSelectedAtomId(null);
           showToast("Connected atoms");
         }
         // B. User tapped the ALREADY selected atom:
-        // Sprout a new substituent bond!
+        // Deselect it!
         else if (selectedAtomId === hitAtom.id) {
-          const nextM = addSubstituent(molRef.current, hitAtom.id, activeElement, bondOrder);
-          pushState(nextM);
-          showToast("Added substituent");
+          setSelectedAtomId(null);
+          showToast("Deselected atom");
         }
         // C. User tapped an unselected atom:
-        // Select it!
         else {
-          setSelectedAtomId(hitAtom.id);
-          setSelectedBondId(null);
+          // If the element selected in toolbar differs from atom's element, update element
+          if (hitAtom.el !== activeElement) {
+            pushState(setAtomElement(molRef.current, hitAtom.id, activeElement));
+            showToast(`Changed atom to ${activeElement}`);
+          } else {
+            setSelectedAtomId(hitAtom.id);
+            setSelectedBondId(null);
+          }
         }
       } else {
         // Tapped empty canvas
-        if (selectedAtomId != null) {
-          // If an atom was selected, tap empty canvas to extend chain towards that point!
-          const nextM = drawBondTo(
-            molRef.current,
-            selectedAtomId,
-            getAtom(molRef.current, selectedAtomId),
-            world,
-            bondOrder,
-            activeElement
-          );
-          pushState(nextM);
-          // Select the newly added atom
-          const newestAtom = nextM.atoms[nextM.atoms.length - 1];
-          if (newestAtom) setSelectedAtomId(newestAtom.id);
-          showToast("Extended bond");
+        if (selectedAtomId != null || selectedBondId != null) {
+          // Tapping empty canvas when an atom or bond is selected DESELECTS IT!
+          setSelectedAtomId(null);
+          setSelectedBondId(null);
+          showToast("Deselected");
         } else {
-          // If nothing was selected, place a starter atom
-          const { mol: nextM, id } = addAtom(molRef.current, world.x, world.y, activeElement);
+          // If nothing was selected, place an atom
+          const { mol: nextM } = addAtom(molRef.current, world.x, world.y, activeElement);
           pushState(nextM);
-          setSelectedAtomId(id);
+          setSelectedAtomId(null);
           showToast(`Added ${activeElement} atom`);
         }
       }
@@ -892,6 +885,24 @@ export default function MobileMolecularEditor({
       {toastMsg && (
         <div className="absolute top-14 left-1/2 -translate-x-1/2 z-40 bg-slate-900/90 text-white text-xs font-medium px-4 py-1.5 rounded-full shadow-lg backdrop-blur-md animate-in fade-in slide-in-from-top-1 pointer-events-none">
           {toastMsg}
+        </div>
+      )}
+
+      {/* Active Compound / Ring Template Banner with 1-click Deselect */}
+      {activeTool === "ring" && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 bg-indigo-600 text-white text-xs font-semibold px-3.5 py-1.5 rounded-full shadow-lg animate-in fade-in slide-in-from-top-1">
+          <span>Compound: {activeRing === "benzene" ? "Benzene" : `${activeRing}-Ring`}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTool("draw");
+              setShowRingFlyout(false);
+              showToast("Deselected compound");
+            }}
+            className="bg-white/20 hover:bg-white/30 text-white rounded-full px-2 py-0.5 text-2xs transition-colors cursor-pointer"
+          >
+            Deselect (✕)
+          </button>
         </div>
       )}
 
@@ -1227,21 +1238,47 @@ export default function MobileMolecularEditor({
         {showElementFlyout && (
           <div className="flex items-center gap-1.5 overflow-x-auto py-1 px-0.5 border-b border-slate-100 animate-in fade-in slide-in-from-bottom-2">
             <span className="text-2xs font-semibold uppercase text-slate-400 shrink-0 mr-1">Elements:</span>
-            {COMMON_ELEMENTS.slice(0, 7).map((sym) => (
+            {!COMMON_ELEMENTS.slice(0, 7).includes(activeElement) && (
               <button
-                key={sym}
                 type="button"
-                onClick={() => handleSelectElement(sym)}
-                className={`min-w-[38px] h-9 px-2.5 rounded-lg border text-xs font-bold transition-all shrink-0 ${
-                  activeElement === sym
-                    ? "bg-indigo-600 border-indigo-600 text-white shadow-xs"
-                    : "bg-slate-100 border-slate-200 text-slate-800 hover:bg-slate-200"
-                }`}
-                style={{ color: activeElement === sym ? "#fff" : ELEMENT_COLORS[sym] || "#0f172a" }}
+                onClick={() => {
+                  handleSelectElement("C");
+                  showToast(`Deselected ${activeElement} (reverted to C)`);
+                }}
+                className="min-w-[42px] h-9 px-2.5 rounded-lg border text-xs font-bold transition-all shrink-0 bg-indigo-600 border-indigo-600 text-white shadow-xs flex items-center justify-center gap-1"
+                title={`Deselect ${activeElement} (revert to C)`}
               >
-                {sym}
+                <span>{activeElement}</span>
+                <span className="text-3xs text-red-300">✕</span>
               </button>
-            ))}
+            )}
+            {COMMON_ELEMENTS.slice(0, 7).map((sym) => {
+              const isElActive = activeElement === sym;
+              return (
+                <button
+                  key={sym}
+                  type="button"
+                  onClick={() => {
+                    if (isElActive && sym !== "C") {
+                      handleSelectElement("C");
+                      showToast(`Deselected ${sym} (reverted to C)`);
+                    } else {
+                      handleSelectElement(sym);
+                    }
+                  }}
+                  className={`min-w-[38px] h-9 px-2.5 rounded-lg border text-xs font-bold transition-all shrink-0 flex items-center justify-center gap-0.5 ${
+                    isElActive
+                      ? "bg-indigo-600 border-indigo-600 text-white shadow-xs"
+                      : "bg-slate-100 border-slate-200 text-slate-800 hover:bg-slate-200"
+                  }`}
+                  style={{ color: isElActive ? "#fff" : ELEMENT_COLORS[sym] || "#0f172a" }}
+                  title={isElActive && sym !== "C" ? `Deselect ${sym} (revert to C)` : `Select ${sym}`}
+                >
+                  <span>{sym}</span>
+                  {isElActive && sym !== "C" && <span className="text-3xs text-slate-300">✕</span>}
+                </button>
+              );
+            })}
             <button
               type="button"
               onClick={() => setShowAllElementsModal(true)}
@@ -1256,61 +1293,40 @@ export default function MobileMolecularEditor({
         {showRingFlyout && (
           <div className="flex items-center gap-1.5 overflow-x-auto py-1 px-0.5 border-b border-slate-100 animate-in fade-in slide-in-from-bottom-2">
             <span className="text-2xs font-semibold uppercase text-slate-400 shrink-0 mr-1">Rings:</span>
-            <button
-              type="button"
-              onClick={() => handleSelectRing("benzene")}
-              className={`min-h-[38px] px-3 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
-                activeRing === "benzene" && activeTool === "ring"
-                  ? "bg-indigo-600 border-indigo-600 text-white"
-                  : "bg-slate-100 border-slate-200 text-slate-800"
-              }`}
-            >
-              <span>⬡</span> Benzene
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectRing(6)}
-              className={`min-h-[38px] px-3 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
-                activeRing === 6 && activeTool === "ring"
-                  ? "bg-indigo-600 border-indigo-600 text-white"
-                  : "bg-slate-100 border-slate-200 text-slate-800"
-              }`}
-            >
-              <span>⬡</span> 6-Ring
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectRing(5)}
-              className={`min-h-[38px] px-3 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
-                activeRing === 5 && activeTool === "ring"
-                  ? "bg-indigo-600 border-indigo-600 text-white"
-                  : "bg-slate-100 border-slate-200 text-slate-800"
-              }`}
-            >
-              <span>⬠</span> 5-Ring
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectRing(4)}
-              className={`min-h-[38px] px-3 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
-                activeRing === 4 && activeTool === "ring"
-                  ? "bg-indigo-600 border-indigo-600 text-white"
-                  : "bg-slate-100 border-slate-200 text-slate-800"
-              }`}
-            >
-              <span>◻</span> 4-Ring
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectRing(3)}
-              className={`min-h-[38px] px-3 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
-                activeRing === 3 && activeTool === "ring"
-                  ? "bg-indigo-600 border-indigo-600 text-white"
-                  : "bg-slate-100 border-slate-200 text-slate-800"
-              }`}
-            >
-              <span>△</span> 3-Ring
-            </button>
+            {[
+              { id: "benzene", label: "Benzene", icon: "⬡" },
+              { id: 6, label: "6-Ring", icon: "⬡" },
+              { id: 5, label: "5-Ring", icon: "⬠" },
+              { id: 4, label: "4-Ring", icon: "◻" },
+              { id: 3, label: "3-Ring", icon: "△" },
+            ].map((r) => {
+              const isRingActive = activeTool === "ring" && activeRing === r.id;
+              return (
+                <button
+                  key={String(r.id)}
+                  type="button"
+                  onClick={() => {
+                    if (isRingActive) {
+                      setActiveTool("draw");
+                      setShowRingFlyout(false);
+                      showToast(`Deselected ${r.label}`);
+                    } else {
+                      handleSelectRing(r.id);
+                    }
+                  }}
+                  className={`min-h-[38px] px-3 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
+                    isRingActive
+                      ? "bg-indigo-600 border-indigo-600 text-white shadow-xs"
+                      : "bg-slate-100 border-slate-200 text-slate-800 hover:bg-slate-200"
+                  }`}
+                  title={isRingActive ? `Click to deselect ${r.label}` : `Select ${r.label}`}
+                >
+                  <span>{r.icon}</span>
+                  <span>{r.label}</span>
+                  {isRingActive && <span className="text-3xs bg-white/20 rounded px-1">✕</span>}
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -1373,9 +1389,15 @@ export default function MobileMolecularEditor({
           <button
             type="button"
             onClick={() => {
-              setShowRingFlyout(!showRingFlyout);
-              setShowElementFlyout(false);
-              if (activeTool !== "ring") setActiveTool("ring");
+              if (activeTool === "ring") {
+                setActiveTool("draw");
+                setShowRingFlyout(false);
+                showToast("Deselected ring tool");
+              } else {
+                setShowRingFlyout(!showRingFlyout);
+                setShowElementFlyout(false);
+                setActiveTool("ring");
+              }
             }}
             className={`min-h-[46px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-semibold border transition-all ${
               activeTool === "ring" || showRingFlyout
@@ -1394,9 +1416,16 @@ export default function MobileMolecularEditor({
           <button
             type="button"
             onClick={() => {
-              setActiveTool("move");
-              setShowElementFlyout(false);
-              setShowRingFlyout(false);
+              if (activeTool === "move") {
+                setActiveTool("draw");
+                setSelectedAtomId(null);
+                setSelectedBondId(null);
+                showToast("Deselected move tool");
+              } else {
+                setActiveTool("move");
+                setShowElementFlyout(false);
+                setShowRingFlyout(false);
+              }
             }}
             className={`min-h-[46px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-semibold border transition-all ${
               activeTool === "move"
@@ -1414,9 +1443,14 @@ export default function MobileMolecularEditor({
           <button
             type="button"
             onClick={() => {
-              setActiveTool("erase");
-              setShowElementFlyout(false);
-              setShowRingFlyout(false);
+              if (activeTool === "erase") {
+                setActiveTool("draw");
+                showToast("Deselected erase tool");
+              } else {
+                setActiveTool("erase");
+                setShowElementFlyout(false);
+                setShowRingFlyout(false);
+              }
             }}
             className={`min-h-[46px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-semibold border transition-all ${
               activeTool === "erase"
