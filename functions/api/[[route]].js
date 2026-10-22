@@ -6,6 +6,8 @@
  * ==============================================================================
  */
 
+import { runAgent, createToolRegistry, AGENT_LIMITS } from "./agent.js";
+
 // Helper to return JSON responses with CORS headers
 function jsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -512,18 +514,102 @@ Respond strictly in valid JSON format:
  * 5. CONVERSATIONAL AI CHAT (WITH COMPOUND GROUNDING & D1 PERSISTENCE)
  * -----------------------------------------------------------------------------
  */
+/**
+ * Invokes an existing route handler in-process (no recursive public HTTP call)
+ * and normalizes its Response into `{ ok, status, data }` for the agent tools.
+ */
+async function invokeHandler(handler, body, env) {
+  const res = await handler(
+    new Request("http://internal/agent-tool", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+    env
+  );
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
+// Allowlisted agent tools, backed by the existing chemistry handlers.
+const agentToolRegistry = createToolRegistry({
+  generateStructure: (body, env) => invokeHandler(handleGenerateStructure, body, env),
+  identify: (body, env) => invokeHandler(handleIdentify, body, env),
+  lookupStructure: (body, env) => invokeHandler(handleLookupStructure, body, env),
+  analyze: (body, env) => invokeHandler(handleAnalyze, body, env),
+  explainStructure: (body, env) => invokeHandler(handleExplainStructure, body, env),
+});
+
+async function loadSessionHistory(env, sessionId) {
+  if (!env.DB || !sessionId) return [];
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT sender, message FROM chat_messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
+    )
+      .bind(sessionId, AGENT_LIMITS.MAX_HISTORY_MESSAGES)
+      .all();
+    return (results || [])
+      .reverse()
+      .map((r) => ({ role: r.sender === "assistant" ? "assistant" : "user", content: r.message }));
+  } catch (err) {
+    console.warn("[D1 History Load Notice]:", err.message);
+    return [];
+  }
+}
+
 async function handleChat(request, env) {
   const body = await request.json().catch(() => ({}));
   const message = (body.message || "").trim();
-  const history = Array.isArray(body.history) ? body.history : [];
-  const compound = body.compound || null;
+  let history = Array.isArray(body.history) ? body.history : [];
+  const compound = body.compound && typeof body.compound === "object" ? body.compound : null;
   const sessionId = body.sessionId || null;
 
   if (!message) {
     return jsonResponse({ error: "Message is required." }, 400);
   }
 
-  // Build Chemistry System Prompt
+  if (message.length > AGENT_LIMITS.MAX_MESSAGE_CHARS) {
+    return jsonResponse(
+      { error: `Message exceeds the maximum length of ${AGENT_LIMITS.MAX_MESSAGE_CHARS} characters.` },
+      400
+    );
+  }
+
+  // Agent path (default). Set CHAT_AGENT_ENABLED="false" to use the legacy direct chat.
+  if (String(env.CHAT_AGENT_ENABLED ?? "true").toLowerCase() !== "false") {
+    if (!history.length && sessionId) {
+      history = await loadSessionHistory(env, sessionId);
+    }
+
+    let agentResult;
+    try {
+      agentResult = await runAgent({
+        message,
+        history,
+        compound,
+        env,
+        registry: agentToolRegistry,
+        callAI,
+      });
+    } catch (err) {
+      console.error("[ChemAI Agent Error]:", sanitizeError(err?.message));
+      return jsonResponse(
+        { error: "ChemAI agent could not complete the request.", details: sanitizeError(err?.message) },
+        502
+      );
+    }
+
+    await persistChatTurn(env, sessionId, compound, message, agentResult);
+
+    return jsonResponse({
+      reply: agentResult.reply,
+      provider: agentResult.provider,
+      model: agentResult.model,
+      agent: agentResult.agent,
+    });
+  }
+
+  // Legacy direct chat: Build Chemistry System Prompt
   let systemPrompt = `You are ChemAI, an expert chemistry learning assistant for university and research chemistry.
 Your role: Explain chemical principles clearly, accurately, and conceptually.
 Answer general chemistry inquiries (thermodynamics, mechanisms, stereochemistry, orbitals) thoroughly.`;
@@ -550,32 +636,36 @@ Anchor your explanations to this molecule when relevant. Distinguish verified fa
   });
 
   // Persist to Cloudflare D1 Chat History (if session ID provided)
-  if (env.DB && sessionId) {
-    try {
-      const msgIdUser = `msg_${Date.now()}_u`;
-      const msgIdAi = `msg_${Date.now()}_a`;
-
-      await env.DB.batch([
-        env.DB.prepare(
-          "INSERT OR IGNORE INTO chat_sessions (id, title, compound_cid) VALUES (?, ?, ?)"
-        ).bind(sessionId, compound ? `Inquiry on ${compound.name}` : "General Chemistry", compound?.cid || null),
-        env.DB.prepare(
-          "INSERT INTO chat_messages (id, session_id, sender, message, compound_context) VALUES (?, ?, ?, ?, ?)"
-        ).bind(msgIdUser, sessionId, "user", message, compound ? JSON.stringify(compound) : null),
-        env.DB.prepare(
-          "INSERT INTO chat_messages (id, session_id, sender, message, compound_context, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).bind(msgIdAi, sessionId, "assistant", aiResult.text, compound ? JSON.stringify(compound) : null, aiResult.provider, aiResult.model),
-      ]);
-    } catch (d1ChatErr) {
-      console.warn("[D1 Chat Persistence Notice]:", d1ChatErr.message);
-    }
-  }
+  await persistChatTurn(env, sessionId, compound, message, aiResult);
 
   return jsonResponse({
     reply: aiResult.text,
     provider: aiResult.provider,
     model: aiResult.model,
   });
+}
+
+async function persistChatTurn(env, sessionId, compound, message, aiResult) {
+  if (!env.DB || !sessionId) return;
+  const replyText = aiResult.reply ?? aiResult.text;
+  try {
+    const msgIdUser = `msg_${Date.now()}_u`;
+    const msgIdAi = `msg_${Date.now()}_a`;
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO chat_sessions (id, title, compound_cid) VALUES (?, ?, ?)"
+      ).bind(sessionId, compound ? `Inquiry on ${compound.name}` : "General Chemistry", compound?.cid || null),
+      env.DB.prepare(
+        "INSERT INTO chat_messages (id, session_id, sender, message, compound_context) VALUES (?, ?, ?, ?, ?)"
+      ).bind(msgIdUser, sessionId, "user", message, compound ? JSON.stringify(compound) : null),
+      env.DB.prepare(
+        "INSERT INTO chat_messages (id, session_id, sender, message, compound_context, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).bind(msgIdAi, sessionId, "assistant", replyText, compound ? JSON.stringify(compound) : null, aiResult.provider, aiResult.model),
+    ]);
+  } catch (d1ChatErr) {
+    console.warn("[D1 Chat Persistence Notice]:", d1ChatErr.message);
+  }
 }
 
 /**
