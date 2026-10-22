@@ -5,6 +5,7 @@ import { ChemAINeuralHexIcon } from "../components/ChemAIIcons";
 import DesktopMolecularEditor from "../components/DesktopMolecularEditor";
 import MobileMolecularEditor from "../components/MobileMolecularEditor";
 import { useMoleculeManager } from "../lib/useMoleculeManager";
+import { createEditorBridge, registerEditorBridge } from "../lib/editorBridge";
 import { API_ROUTES } from "../config/api";
 
 // Quick example templates to test and draw
@@ -101,6 +102,136 @@ export default function MolecularEditor() {
     setViewModeOverride("desktop");
     showStatus("Switched to Desktop Molecular Editor view.");
   };
+
+  // ---------------------------------------------------------------------------
+  // Phase 2A: Controlled Molecular Editor Bridge & Safe Replacement Approval
+  // ---------------------------------------------------------------------------
+  const desktopEditorRef = useRef(null);
+  const mobileEditorRef = useRef(null);
+  const bridgeRef = useRef(null);
+  const [pendingBridgeReplacement, setPendingBridgeReplacement] = useState(null);
+
+  const renderBridgeApprovalModal = () => {
+    if (!pendingBridgeReplacement) return null;
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+        <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden text-slate-800">
+          <div className="p-5 border-b border-slate-100 flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center font-bold text-lg shrink-0">
+              ⚠️
+            </div>
+            <div>
+              <h3 className="font-bold text-base text-slate-900">Replace Current Drawing?</h3>
+              <p className="text-xs text-slate-500">
+                Action request from {pendingBridgeReplacement.source || "external agent"}
+              </p>
+            </div>
+          </div>
+          <div className="p-5 space-y-3 text-sm">
+            <p className="text-slate-600 leading-relaxed">
+              An action requested loading a new structure onto the canvas. Your current canvas already contains{" "}
+              <strong className="text-slate-900">{pendingBridgeReplacement.currentAtomCount} atom(s)</strong>.
+            </p>
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono break-all text-indigo-700">
+              <span className="text-slate-400 block font-sans text-3xs font-semibold uppercase tracking-wider mb-1">
+                Candidate SMILES
+              </span>
+              {pendingBridgeReplacement.candidateSmiles}
+            </div>
+            <p className="text-xs text-amber-800 bg-amber-50 p-2.5 rounded-lg border border-amber-200/60">
+              Approving will overwrite your currently drawn canvas.
+            </p>
+          </div>
+          <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-2.5">
+            <button
+              type="button"
+              onClick={() => pendingBridgeReplacement.resolve(false)}
+              className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 transition-colors cursor-pointer"
+            >
+              Keep Current Molecule
+            </button>
+            <button
+              type="button"
+              onClick={() => pendingBridgeReplacement.resolve(true)}
+              className="px-4 py-2 rounded-xl text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 transition-colors shadow-sm cursor-pointer"
+            >
+              Approve & Replace
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  useEffect(() => {
+    const target = {
+      getMolecule: () => moleculeManager.molRef.current,
+      exportCurrent: () => moleculeManager.exportCurrent(),
+      loadSmiles: (smiles) => {
+        moleculeManager.loadSmiles(smiles);
+        setIdentifyResult(null);
+        setIdentifyError(null);
+        setExplainResult(null);
+        setExplainError(null);
+      },
+      fitView: () => {
+        if (activeView === "mobile" && mobileEditorRef.current?.fitToScreen) {
+          return mobileEditorRef.current.fitToScreen();
+        }
+        if (desktopEditorRef.current?.fitToScreen) {
+          return desktopEditorRef.current.fitToScreen();
+        }
+        return null;
+      },
+      getViewport: () => {
+        if (activeView === "mobile" && mobileEditorRef.current?.getViewport) {
+          return mobileEditorRef.current.getViewport();
+        }
+        if (desktopEditorRef.current?.getViewport) {
+          return desktopEditorRef.current.getViewport();
+        }
+        return null;
+      },
+      getViewMode: () => activeView,
+      isReady: () => isEditorReady,
+      requestApproval: ({ candidateSmiles, currentAtomCount, source, parsedAtomCount }) => {
+        return new Promise((resolve) => {
+          setPendingBridgeReplacement({
+            candidateSmiles,
+            currentAtomCount,
+            source,
+            parsedAtomCount,
+            resolve: (val) => {
+              setPendingBridgeReplacement(null);
+              resolve(val);
+            },
+          });
+        });
+      },
+    };
+
+    const bridge = createEditorBridge(target);
+    bridgeRef.current = bridge;
+    const unregister = registerEditorBridge(bridge);
+
+    if (typeof window !== "undefined") {
+      window.__CHEMAI_EDITOR_BRIDGE__ = {
+        read_editor_structure: bridge.read_editor_structure,
+        load_structure_into_editor: bridge.load_structure_into_editor,
+        fit_canvas_view: bridge.fit_canvas_view,
+        get_editor_capabilities: bridge.get_editor_capabilities,
+        executeAction: bridge.executeAction,
+      };
+    }
+
+    return () => {
+      unregister();
+      bridgeRef.current = null;
+      if (typeof window !== "undefined" && window.__CHEMAI_EDITOR_BRIDGE__) {
+        delete window.__CHEMAI_EDITOR_BRIDGE__;
+      }
+    };
+  }, [moleculeManager, activeView, isEditorReady]);
 
   const { loadSmiles: loadSmilesToManager } = moleculeManager;
 
@@ -742,6 +873,8 @@ export default function MolecularEditor() {
             canUndo={moleculeManager.canUndo}
             canRedo={moleculeManager.canRedo}
             clear={handleClearStructure}
+            loadVersion={moleculeManager.loadVersion}
+            editorRef={mobileEditorRef}
             onIdentify={(exported) => handleIdentifyMolecule(exported)}
             identifyLoading={identifyLoading}
             onOpenChat={() => handleOpenChat()}
@@ -884,6 +1017,7 @@ export default function MolecularEditor() {
             </div>
           )}
         </div>
+        {renderBridgeApprovalModal()}
       </div>
     );
   }
@@ -2071,6 +2205,7 @@ export default function MolecularEditor() {
             identifyLoading={identifyLoading}
             onOpenChat={() => handleOpenChat()}
             onSwitchToMobile={handleSwitchToMobile}
+            editorRef={desktopEditorRef}
           />
         </div>
 
@@ -2178,6 +2313,7 @@ export default function MolecularEditor() {
           </div>
         )}
       </main>
+      {renderBridgeApprovalModal()}
     </div>
   );
 }

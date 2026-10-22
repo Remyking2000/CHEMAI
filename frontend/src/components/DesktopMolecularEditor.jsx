@@ -58,6 +58,7 @@ export default function DesktopMolecularEditor({
   onOpenChat,
   onSwitchToMobile,
   className = "",
+  editorRef = null,
 }) {
   // ---------------------------------------------------------------------------
   // 1. Authoritative Molecule & History State
@@ -221,7 +222,31 @@ export default function DesktopMolecularEditor({
     setPan(nextPan);
     zoomRef.current = nextZoom;
     panRef.current = nextPan;
+    return { zoom: nextZoom, pan: nextPan };
   }, []);
+
+  // Controlled Editor Bridge API Ref hook
+  useEffect(() => {
+    if (!editorRef) return;
+    const api = {
+      fitToScreen: () => {
+        hasUserAdjustedViewportRef.current = false;
+        return fitMoleculeToViewport(currentMolRef.current, dimensionsRef.current);
+      },
+      getViewport: () => ({ zoom: zoomRef.current, pan: panRef.current }),
+      getDimensions: () => ({ ...dimensionsRef.current }),
+      getMolecule: () => currentMolRef.current,
+    };
+    if (typeof editorRef === "function") {
+      editorRef(api);
+    } else if (editorRef && typeof editorRef === "object") {
+      editorRef.current = api;
+    }
+    return () => {
+      if (typeof editorRef === "function") editorRef(null);
+      else if (editorRef && typeof editorRef === "object") editorRef.current = null;
+    };
+  }, [editorRef, fitMoleculeToViewport]);
 
   const isMoleculeClipped = useCallback((mol, dims, curZoom, curPan) => {
     if (!mol || !mol.atoms || mol.atoms.length === 0) return false;

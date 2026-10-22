@@ -35,6 +35,7 @@ jobs:
           node test_chemistry.mjs
           node test_editor_logic.mjs
           node test_agent.mjs
+          node test_editor_bridge.mjs
 
       - name: Deploy to Cloudflare (if credentials provided)
         if: github.ref == 'refs/heads/main' && env.HAS_CF_TOKEN == 'true'

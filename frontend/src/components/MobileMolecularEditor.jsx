@@ -42,6 +42,7 @@ export default function MobileMolecularEditor({
   canUndo: externalCanUndo,
   canRedo: externalCanRedo,
   clear: externalClear,
+  loadVersion = 0,
   initialMol = null,
   initialSmiles = null,
   onIdentify,
@@ -51,6 +52,7 @@ export default function MobileMolecularEditor({
   onSearchCandidate,
   onStructureChange,
   className = "",
+  editorRef = null,
 }) {
   // ---------------------------------------------------------------------------
   // Molecule & History State (Supports both controlled and standalone modes)
@@ -272,10 +274,10 @@ export default function MobileMolecularEditor({
   // Fit Molecule to Canvas
   const handleFitToScreen = useCallback(() => {
     const currentMol = molRef.current;
-    if (!currentMol.atoms.length) {
+    if (!currentMol || !currentMol.atoms || !currentMol.atoms.length) {
       setPan({ x: 0, y: 0 });
       setZoom(1);
-      return;
+      return { zoom: 1, pan: { x: 0, y: 0 }, centerX: 0, centerY: 0 };
     }
     let minX = Infinity;
     let maxX = -Infinity;
@@ -298,10 +300,41 @@ export default function MobileMolecularEditor({
       Math.max(0.55, Math.min(targetW / (molW || 1), targetH / (molH || 1))),
       1.6
     );
+    const newPan = { x: -midX * fitZoom, y: -midY * fitZoom };
     setZoom(fitZoom);
-    setPan({ x: -midX * fitZoom, y: -midY * fitZoom });
+    setPan(newPan);
     showToast("Framed molecule");
+    return { zoom: fitZoom, pan: newPan, centerX: midX, centerY: midY };
   }, [dimensions, showToast]);
+
+  // Re-frame canvas and reset selection when an external structure is loaded
+  useEffect(() => {
+    if (loadVersion > 0) {
+      setSelectedAtomId(null);
+      setSelectedBondId(null);
+      handleFitToScreen();
+    }
+  }, [loadVersion, handleFitToScreen]);
+
+  // Controlled Editor Bridge API Ref hook
+  useEffect(() => {
+    if (!editorRef) return;
+    const api = {
+      fitToScreen: handleFitToScreen,
+      getViewport: () => ({ zoom, pan }),
+      getDimensions: () => ({ ...dimensions }),
+      getMolecule: () => molRef.current,
+    };
+    if (typeof editorRef === "function") {
+      editorRef(api);
+    } else if (editorRef && typeof editorRef === "object") {
+      editorRef.current = api;
+    }
+    return () => {
+      if (typeof editorRef === "function") editorRef(null);
+      else if (editorRef && typeof editorRef === "object") editorRef.current = null;
+    };
+  }, [editorRef, handleFitToScreen, zoom, pan, dimensions]);
 
   const handleZoomChange = (factor) => {
     setZoom((z) => Math.min(2.5, Math.max(0.45, z * factor)));
