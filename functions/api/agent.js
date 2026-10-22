@@ -30,11 +30,11 @@ export const AGENT_LIMITS = Object.freeze({
   MAX_HISTORY_CHARS_PER_MESSAGE: 2000,
   MAX_TOOL_RESULT_CHARS: 6000,
   MAX_REPLY_CHARS: 20000,
-  MODEL_TIMEOUT_MS: 25000,
+  MODEL_TIMEOUT_MS: 12000,
   TOOL_TIMEOUT_MS: 20000,
   CAPABILITY_TIMEOUT_MS: 4000,
   TOTAL_BUDGET_MS: 60000, // hard wall-clock budget for the whole request
-  FINAL_ANSWER_RESERVE_MS: 15000, // stop starting new tool rounds when less than this remains
+  FINAL_ANSWER_RESERVE_MS: 12000, // stop starting new tool rounds when less than this remains
   MIN_MODEL_CALL_MS: 3000, // do not start a model call with less time than this
 });
 
@@ -572,7 +572,10 @@ export async function getToolSupport(model, env, fetchImpl, now = Date.now) {
       const endpoints = json?.data?.endpoints;
       if (Array.isArray(endpoints) && endpoints.length) {
         supported = endpoints.some(
-          (ep) => Array.isArray(ep.supported_parameters) && ep.supported_parameters.includes("tools")
+          (ep) =>
+            Array.isArray(ep.supported_parameters) &&
+            ep.supported_parameters.includes("tools") &&
+            (typeof ep.status !== "number" || ep.status >= 0)
         );
       }
     }
@@ -626,11 +629,11 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
     if (supported === false) continue;
     const callTimeout = Math.min(limits.MODEL_TIMEOUT_MS, deadline - now());
     if (callTimeout < limits.MIN_MODEL_CALL_MS) return { type: "budget_exhausted" };
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), callTimeout) : null;
     try {
-      const res = await fetchWithTimeout(
-        fetchImpl,
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
+      const res = await withTimeout(
+        fetchImpl("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -646,17 +649,19 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
             temperature: 0.2,
             max_tokens: 1800,
           }),
-        },
-        callTimeout
+          ...(controller ? { signal: controller.signal } : {}),
+        }),
+        callTimeout,
+        `OpenRouter (${model})`
       );
       if (!res.ok) {
-        const errText = await res.text().catch(() => "");
+        const errText = await withTimeout(res.text(), 3000, "error body").catch(() => "");
         if ((res.status === 400 || res.status === 404) && /tool/i.test(errText)) {
           capabilityCache.set(model, { supported: false, at: now() });
         }
         continue;
       }
-      const data = await res.json();
+      const data = await withTimeout(res.json(), Math.max(2000, deadline - now()), `OpenRouter body (${model})`);
       const msg = data?.choices?.[0]?.message;
       if (!msg) continue;
       if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
@@ -676,7 +681,10 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
         return { type: "final", text: msg.content.trim(), provider: "openrouter", model };
       }
     } catch (err) {
+      capabilityCache.set(model, { supported: false, at: now() });
       console.warn(`[ChemAI Agent] native call (${model}) failed:`, sanitizeText(err?.message));
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
   return null;

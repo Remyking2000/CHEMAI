@@ -817,11 +817,14 @@ async function handleGetHistory(request, env, url) {
  * AI CLIENT GATEWAY (OpenRouter / Gemini / Cloudflare AI / Keyless Edge Fallback)
  * -----------------------------------------------------------------------------
  */
-async function fetchWithTimeout(url, options, timeoutMs = 10000) {
+async function fetchJsonWithTimeout(url, options, timeoutMs = 8000) {
   const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    return await fetch(url, controller ? { ...options, signal: controller.signal } : options);
+    const res = await fetch(url, controller ? { ...options, signal: controller.signal } : options);
+    if (!res.ok) return { ok: false, status: res.status, data: null };
+    const data = await res.json();
+    return { ok: true, status: res.status, data };
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -872,18 +875,18 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
 
       contents.push({ role: "user", parts: [{ text: prompt }] });
 
-      const gRes = await fetchWithTimeout(
+      const gRes = await fetchJsonWithTimeout(
         geminiUrl,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ contents }),
         },
-        10000
+        8000
       );
 
       if (gRes.ok) {
-        const gData = await gRes.json();
+        const gData = gRes.data;
         const replyText = gData?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (replyText) {
           return { text: replyText, provider: "gemini", model };
@@ -906,7 +909,7 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
 
     for (const model of modelsToTry) {
       try {
-        const oRes = await fetchWithTimeout(
+        const oRes = await fetchJsonWithTimeout(
           "https://openrouter.ai/api/v1/chat/completions",
           {
             method: "POST",
@@ -922,11 +925,11 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
               temperature: 0.2,
             }),
           },
-          10000
+          8000
         );
 
         if (oRes.ok) {
-          const oData = await oRes.json();
+          const oData = oRes.data;
           const replyText = oData?.choices?.[0]?.message?.content;
           if (replyText) {
             return { text: replyText, provider: "openrouter", model };
@@ -967,7 +970,7 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
 
   // 4. Keyless Edge LLM Fallback (with User-Agent and seed for reliable completion)
   try {
-    const pRes = await fetchWithTimeout(
+    const pRes = await fetchJsonWithTimeout(
       "https://text.pollinations.ai/openai",
       {
         method: "POST",
@@ -982,11 +985,11 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
           temperature: 0.2,
         }),
       },
-      8000
+      6000
     );
 
     if (pRes.ok) {
-      const pData = await pRes.json();
+      const pData = pRes.data;
       const replyText = pData?.choices?.[0]?.message?.content;
       if (replyText && replyText.trim()) {
         return {
