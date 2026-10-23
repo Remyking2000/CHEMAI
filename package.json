@@ -21,5 +21,8 @@
     "d1:create": "wrangler d1 create chemai-db",
     "d1:migrate:local": "wrangler d1 migrations apply chemai-db --local",
     "d1:migrate:remote": "wrangler d1 migrations apply chemai-db --remote"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.16.0"
   }
 }
