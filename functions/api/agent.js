@@ -859,27 +859,16 @@ async function structuredNext({ env, callAI, systemPrompt, history, message, ste
 /* -------------------------------------------------------------------------- */
 
 function summarizeSteps(steps, reason) {
-  const isClientOnly = steps.every((s) => s.runtime === "client" || s.name === "fit_canvas_view" || s.name === "load_structure_into_editor");
-  const header = isClientOnly
-    ? "Successfully completed requested editor operation:"
-    : reason === "ai_unavailable"
-    ? "I gathered the following information, but the AI model became unavailable before I could write a full answer:"
-    : reason === "time_budget"
-    ? "I ran out of time for this request. Here is what I completed:"
-    : "I reached the tool-use limit for this request before completing the analysis. Here is what I completed:";
+  const header =
+    reason === "ai_unavailable"
+      ? "I gathered the following information, but the AI model became unavailable before I could write a full answer:"
+      : reason === "time_budget"
+      ? "I ran out of time for this request. Here is what I completed:"
+      : "I reached the tool-use limit for this request before completing the analysis. Here is what I completed:";
   const lines = steps.map((s) => {
     const args = s.parsedArguments ? JSON.stringify(s.parsedArguments) : "";
     if (!s.result.ok) return `- **${s.name}** ${args}: failed — ${s.result.error}`;
     const d = s.result.data || {};
-    if (s.name === "fit_canvas_view") {
-      return "- **fit_canvas_view**: Centered and fitted the canvas view around the molecule.";
-    }
-    if (s.name === "load_structure_into_editor") {
-      return `- **load_structure_into_editor**: Loaded structure into the editor canvas.`;
-    }
-    if (s.name === "read_editor_structure") {
-      return `- **read_editor_structure**: Read canvas (${d.atomCount || 0} atoms, SMILES: \`${d.smiles || "empty"}\`).`;
-    }
     const facts = [
       d.name || d.proposedName || d.compound,
       d.molecularFormula && `formula ${d.molecularFormula}`,
@@ -892,9 +881,6 @@ function summarizeSteps(steps, reason) {
       .join(", ");
     return `- **${s.name}** ${args}: ${facts || "completed"} (source: ${s.result.provenance || "tool"})`;
   });
-  if (isClientOnly) {
-    return `${header}\n\n${lines.join("\n")}`;
-  }
   return `${header}\n\n${lines.join("\n") || "- No tool steps completed."}\n\n**Unresolved:** the final interpretation of these results. Please try again or narrow the question.`;
 }
 

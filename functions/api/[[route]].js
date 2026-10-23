@@ -1121,45 +1121,6 @@ async function buildFallbackChemistryResponse(prompt, systemPrompt = "") {
     });
   }
 
-  // 2b. Handle structured tool calls when agent is running in structured mode
-  if (systemPrompt && systemPrompt.includes('{"action":"call_tool"')) {
-    if (/(fit|center|frame|zoom)\b.*(canvas|view|drawing|screen|viewport)|(canvas|view|drawing|screen).*(fit|center|frame|zoom)\b/i.test(lower)) {
-      return JSON.stringify({
-        action: "call_tool",
-        tool: "fit_canvas_view",
-        arguments: {},
-      });
-    }
-    if (/(what.*canvas|read.*(editor|canvas|drawing)|identify.*canvas)/i.test(lower)) {
-      return JSON.stringify({
-        action: "call_tool",
-        tool: "read_editor_structure",
-        arguments: {},
-      });
-    }
-    const drawMatch = lower.match(/(?:draw|load|build)\s+([a-z0-9\s-]+?)(?:\s+(?:in|into|onto)\s+(?:my\s+)?(?:editor|canvas)|$)/i);
-    if (drawMatch && drawMatch[1] && !drawMatch[1].includes("canvas")) {
-      const targetMol = drawMatch[1].trim();
-      let foundSmiles = null;
-      if (/caffeine/i.test(targetMol)) {
-        foundSmiles = "CN1C=NC2=C1C(=O)N(C(=O)N2C)C";
-      } else if (/benzene/i.test(targetMol)) {
-        foundSmiles = "c1ccccc1";
-      } else if (/aspirin/i.test(targetMol)) {
-        foundSmiles = "CC(=O)Oc1ccccc1C(=O)O";
-      } else if (/ethanol/i.test(targetMol)) {
-        foundSmiles = "CCO";
-      }
-      if (foundSmiles) {
-        return JSON.stringify({
-          action: "call_tool",
-          tool: "load_structure_into_editor",
-          arguments: { smiles: foundSmiles },
-        });
-      }
-    }
-  }
-
   // 3. Extract attached compound context if present in systemPrompt
   let attached = null;
   if (systemPrompt.includes("ATTACHED VERIFIED COMPOUND CONTEXT:")) {
