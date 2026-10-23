@@ -20,7 +20,29 @@ export default {
 
     // Route all other requests to static assets (with SPA routing)
     if (env.ASSETS) {
-      return env.ASSETS.fetch(request);
+      const res = await env.ASSETS.fetch(request);
+      if (res.status === 404 && !url.pathname.includes(".")) {
+        return env.ASSETS.fetch(new Request(new URL("/", request.url), request));
+      }
+      return res;
+    }
+
+    // SPA fallback when running on bare workers.dev without ASSETS binding
+    if (!url.pathname.includes(".")) {
+      try {
+        const rootRes = await fetch(new URL("/", request.url));
+        if (rootRes.ok) {
+          return new Response(rootRes.body, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "public, max-age=0, must-revalidate",
+            },
+          });
+        }
+      } catch {
+        // fall through to error
+      }
     }
 
     return new Response("Asset handler not available", { status: 404 });
