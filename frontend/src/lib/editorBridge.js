@@ -41,6 +41,13 @@ export const ALLOWED_BRIDGE_ACTIONS = Object.freeze([
   "get_editor_capabilities",
 ]);
 
+export const BRIDGE_ERROR_TYPES = Object.freeze({
+  EDITOR_UNAVAILABLE: "editor_unavailable",
+  INVALID_STRUCTURE: "invalid_structure",
+  REPLACEMENT_REJECTED: "replacement_rejected",
+  EDITOR_OPERATION_FAILED: "editor_operation_failed",
+});
+
 /**
  * Creates a unified editor bridge wrapping the provided editor target.
  *
@@ -71,6 +78,7 @@ export function createEditorBridge(target) {
         return {
           ok: false,
           action: "read_editor_structure",
+          errorType: BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE,
           error: "Editor is not currently ready or mounted.",
         };
       }
@@ -139,6 +147,7 @@ export function createEditorBridge(target) {
       return {
         ok: false,
         action: "read_editor_structure",
+        errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
         error: err?.message || "Unexpected error while reading editor structure.",
       };
     }
@@ -155,6 +164,7 @@ export function createEditorBridge(target) {
         return {
           ok: false,
           action: "load_structure_into_editor",
+          errorType: BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE,
           error: "Editor is not currently ready or mounted.",
         };
       }
@@ -169,6 +179,7 @@ export function createEditorBridge(target) {
         return {
           ok: false,
           action: "load_structure_into_editor",
+          errorType: BRIDGE_ERROR_TYPES.INVALID_STRUCTURE,
           error: "A non-empty SMILES string is required to load a structure.",
         };
       }
@@ -181,6 +192,7 @@ export function createEditorBridge(target) {
           return {
             ok: false,
             action: "load_structure_into_editor",
+            errorType: BRIDGE_ERROR_TYPES.INVALID_STRUCTURE,
             error: "The provided SMILES produced an empty structure with 0 atoms.",
             data: { candidateSmiles: rawSmiles },
           };
@@ -189,6 +201,7 @@ export function createEditorBridge(target) {
         return {
           ok: false,
           action: "load_structure_into_editor",
+          errorType: BRIDGE_ERROR_TYPES.INVALID_STRUCTURE,
           error: `Invalid SMILES syntax: ${err?.message || "Failed to parse structure."}`,
           data: { candidateSmiles: rawSmiles },
         };
@@ -214,6 +227,7 @@ export function createEditorBridge(target) {
             return {
               ok: false,
               action: "load_structure_into_editor",
+              errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
               error: `Approval request failed: ${apprErr?.message}`,
               needsApproval: true,
               data: { candidateSmiles: rawSmiles, currentAtomCount },
@@ -224,6 +238,8 @@ export function createEditorBridge(target) {
             return {
               ok: false,
               action: "load_structure_into_editor",
+              errorType: BRIDGE_ERROR_TYPES.REPLACEMENT_REJECTED,
+              cancelled: true,
               needsApproval: true,
               error: "Structure replacement was declined by user.",
               data: { candidateSmiles: rawSmiles, currentAtomCount },
@@ -234,6 +250,7 @@ export function createEditorBridge(target) {
           return {
             ok: false,
             action: "load_structure_into_editor",
+            errorType: BRIDGE_ERROR_TYPES.REPLACEMENT_REJECTED,
             needsApproval: true,
             error: "Replacing an existing drawn molecule requires explicit user approval.",
             data: { candidateSmiles: rawSmiles, currentAtomCount },
@@ -250,6 +267,7 @@ export function createEditorBridge(target) {
         return {
           ok: false,
           action: "load_structure_into_editor",
+          errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
           error: "Editor target does not support loading structures.",
         };
       }
@@ -289,6 +307,7 @@ export function createEditorBridge(target) {
       return {
         ok: false,
         action: "load_structure_into_editor",
+        errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
         error: err?.message || "Unexpected error while loading structure into editor.",
       };
     }
@@ -304,6 +323,7 @@ export function createEditorBridge(target) {
         return {
           ok: false,
           action: "fit_canvas_view",
+          errorType: BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE,
           error: "Editor is not currently ready or mounted.",
         };
       }
@@ -329,6 +349,7 @@ export function createEditorBridge(target) {
       return {
         ok: false,
         action: "fit_canvas_view",
+        errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
         error: err?.message || "Unexpected error while fitting canvas view.",
       };
     }
@@ -362,6 +383,7 @@ export function createEditorBridge(target) {
       return {
         ok: false,
         action: String(actionName || "unknown"),
+        errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
         error: `Action "${String(actionName)}" is not a supported editor bridge operation. Supported: ${ALLOWED_BRIDGE_ACTIONS.join(", ")}`,
       };
     }

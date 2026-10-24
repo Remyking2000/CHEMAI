@@ -27,12 +27,16 @@ import {
   decodeContinuationToken,
   _resetCapabilityCache,
   AGENT_LIMITS,
+  AGENT_ERROR_TYPES,
+  AgentError,
 } from "./functions/api/agent.js";
+import { onRequest } from "./functions/api/[[route]].js";
 import {
   createEditorBridge,
   registerEditorBridge,
   getActiveEditorBridge,
   ALLOWED_BRIDGE_ACTIONS,
+  BRIDGE_ERROR_TYPES,
 } from "./frontend/src/lib/editorBridge.js";
 import { executeClientTool, sendAgentChat } from "./frontend/src/lib/agentHandshake.js";
 
@@ -805,6 +809,369 @@ console.log("--- Starting ChemAI Agent Molecular Editor Handshake Tests (Phase 2
     assert(statusUpdates.includes("completed"), "Status callback received 'completed'");
   } finally {
     unregister();
+  }
+}
+
+/* 14. Phase 2C: AI Provider Failure (HTTP 502/503 + fallback failure) does not pretend editor action succeeded */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+  const failingFetch = async (url) => {
+    if (String(url).includes("/endpoints")) {
+      return new Response(JSON.stringify({ data: { endpoints: [{ supported_parameters: ["tools"] }] } }), { status: 200 });
+    }
+    return new Response("Upstream provider error", { status: 503 });
+  };
+  const fallbackCallAI = async () => ({
+    text: "### Chemical Profile: **Caffeine** (C8H10N4O2) ...",
+    provider: "chemai-assistant",
+    model: "test/model",
+    diagnostics: [{ type: AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, detail: "OpenRouter HTTP 503" }],
+  });
+
+  let caught = null;
+  try {
+    await runAgent({
+      message: "Draw caffeine in my editor",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: fallbackCallAI,
+      fetchImpl: failingFetch,
+    });
+  } catch (err) {
+    caught = err;
+  }
+
+  assert(caught instanceof AgentError, "Provider outage throws structured AgentError instead of returning generic fallback");
+  assert(caught.type === AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, "Error type is ai_provider_unavailable");
+  assert(caught.status === 502, "HTTP status for provider failure is 502");
+  assert(/drawing was not changed/i.test(caught.message), "Error message confirms drawing was not changed");
+}
+
+/* 15. Phase 2C: Request Timeout surfaces ai_timeout (504) */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+  const timeoutFetch = async (url) => {
+    if (String(url).includes("/endpoints")) {
+      return new Response(JSON.stringify({ data: { endpoints: [{ supported_parameters: ["tools"] }] } }), { status: 200 });
+    }
+    const err = new Error("OpenRouter timed out after 12000 ms");
+    err.code = "TIMEOUT";
+    throw err;
+  };
+  const timeoutCallAI = async () => {
+    const err = new Error("AI provider timed out");
+    err.code = "TIMEOUT";
+    throw err;
+  };
+
+  let caught = null;
+  try {
+    await runAgent({
+      message: "Identify the structure on my canvas",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: timeoutCallAI,
+      fetchImpl: timeoutFetch,
+    });
+  } catch (err) {
+    caught = err;
+  }
+
+  assert(caught instanceof AgentError, "Model timeout throws structured AgentError");
+  assert(caught.type === AGENT_ERROR_TYPES.AI_TIMEOUT, "Error type is ai_timeout");
+  assert(caught.status === 504, "HTTP status for timeout is 504");
+  assert(/time limit/i.test(caught.message), "Timeout message mentions time limit");
+}
+
+/* 16. Phase 2C: Invalid / Malformed Model Response surfaces ai_invalid_response */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+  const malformedFetch = async (url) => {
+    if (String(url).includes("/endpoints")) {
+      return new Response(JSON.stringify({ data: { endpoints: [{ supported_parameters: ["tools"] }] } }), { status: 200 });
+    }
+    return new Response("<<<not json>>>", { status: 200 });
+  };
+  const emptyCallAI = async () => ({
+    text: "   ",
+    provider: "openrouter",
+    model: "test/model",
+  });
+
+  let caught = null;
+  try {
+    await runAgent({
+      message: "Center my canvas",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: emptyCallAI,
+      fetchImpl: malformedFetch,
+    });
+  } catch (err) {
+    caught = err;
+  }
+
+  assert(caught instanceof AgentError, "Malformed/empty model response throws structured AgentError");
+  assert(caught.type === AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, "Error type is ai_invalid_response");
+  assert(/invalid response/i.test(caught.message), "Message explains the AI returned an invalid response");
+}
+
+/* 17. Phase 2C: Unbalanced SMILES syntax (e.g. unclosed ring or paren) rejected before client dispatch */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+  const { fetchImpl } = mockOpenRouter([
+    toolCall("c_bad_ring", "load_structure_into_editor", { smiles: "C1CCCCC" }),
+    { content: "The proposed SMILES had an unclosed ring, so I did not modify your canvas." },
+  ]);
+
+  const res = await runAgent({
+    message: "Load cyclohexane",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl,
+  });
+
+  assert(res.status !== "action_required", "Unbalanced SMILES does not suspend for client execution");
+  assert(res.agent.toolCalls[0].rejected === true, "Unbalanced SMILES is marked rejected");
+  assert(res.agent.toolCalls[0].errorType === AGENT_ERROR_TYPES.INVALID_STRUCTURE, "Rejected SMILES carries errorType invalid_structure");
+}
+
+/* 18. Phase 2C: Bridge & Handshake errorType classification and drawing preservation */
+{
+  // Unmounted / not ready editor -> editor_unavailable
+  const notReadyBridge = createEditorBridge({
+    isReady: () => false,
+    getViewMode: () => "desktop",
+  });
+  const unreadyRead = await notReadyBridge.read_editor_structure();
+  assert(unreadyRead.ok === false && unreadyRead.errorType === BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE, "Unready editor returns errorType editor_unavailable");
+
+  // Existing ethanol drawing on canvas; test invalid SMILES, rejected replacement, and thrown operation error
+  const ethanolGraph = {
+    atoms: [
+      { id: "a1", element: "C", x: 0, y: 0 },
+      { id: "a2", element: "C", x: 1.5, y: 0 },
+      { id: "a3", element: "O", x: 3.0, y: 0 },
+    ],
+    bonds: [
+      { id: "b1", a1: "a1", a2: "a2", order: 1 },
+      { id: "b2", a1: "a2", a2: "a3", order: 1 },
+    ],
+  };
+  let storedMol = JSON.parse(JSON.stringify(ethanolGraph));
+  let approvalDecision = false;
+  let shouldThrowOnLoad = false;
+
+  const target = {
+    isReady: () => true,
+    getViewMode: () => "desktop",
+    getMolecule: () => storedMol,
+    exportCurrent: () => ({ smiles: "CCO", formula: "C2H6O", weight: "46.07" }),
+    requestApproval: async () => approvalDecision,
+    loadSmiles: () => {
+      if (shouldThrowOnLoad) throw new Error("Simulated canvas render failure");
+      storedMol = { atoms: [{ id: "x", element: "N", x: 0, y: 0 }], bonds: [] };
+    },
+  };
+  const bridge = createEditorBridge(target);
+  const unregister = registerEditorBridge(bridge);
+
+  try {
+    // 18a. Invalid structure
+    const badLoad = await executeClientTool("load_structure_into_editor", { smiles: "NOT_A_SMILES_@@@" });
+    assert(badLoad.ok === false && badLoad.errorType === BRIDGE_ERROR_TYPES.INVALID_STRUCTURE, "Invalid SMILES classified as invalid_structure");
+    assert(storedMol.atoms.length === 3, "Drawing preserved after invalid SMILES");
+
+    // 18b. User rejects replacement
+    approvalDecision = false;
+    const rejectedLoad = await executeClientTool("load_structure_into_editor", { smiles: "c1ccccc1" });
+    assert(rejectedLoad.ok === false && rejectedLoad.errorType === BRIDGE_ERROR_TYPES.REPLACEMENT_REJECTED, "Declined replacement classified as replacement_rejected");
+    assert(rejectedLoad.cancelled === true, "Declined replacement sets cancelled: true");
+    assert(storedMol.atoms.length === 3, "Drawing preserved after user declined replacement");
+
+    // 18c. Editor operation throws during approved load
+    approvalDecision = true;
+    shouldThrowOnLoad = true;
+    const failedOp = await executeClientTool("load_structure_into_editor", { smiles: "c1ccccc1" });
+    assert(failedOp.ok === false && failedOp.errorType === BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED, "Thrown bridge error classified as editor_operation_failed");
+    assert(failedOp.cancelled === false, "Thrown operation error is not misclassified as user cancellation");
+    assert(storedMol.atoms.length === 3, "Drawing preserved when loadSmiles throws");
+  } finally {
+    unregister();
+  }
+}
+
+/* 19. Phase 2C: Truthful continuation fallback when AI provider fails AFTER client tool execution */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // Turn 1: Model requests load_structure_into_editor
+  const { fetchImpl: f1 } = mockOpenRouter([
+    toolCall("c_load_1", "load_structure_into_editor", { smiles: "c1ccccc1" }),
+  ]);
+  const suspended = await runAgent({
+    message: "Replace my drawing with benzene",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: f1,
+  });
+
+  // Turn 2a: User declined replacement, AND then AI provider fails on continuation
+  const failingFetch = async () => new Response("Outage", { status: 503 });
+  const fallbackCallAI = async () => ({
+    text: "Generic chemistry profile that should not replace step summary",
+    provider: "chemai-assistant",
+    model: "test/model",
+  });
+
+  const declinedRes = await runAgent({
+    continuationToken: suspended.continuationToken,
+    clientActionResult: {
+      id: suspended.actionRequest.id,
+      tool: suspended.actionRequest.tool,
+      result: {
+        ok: false,
+        errorType: BRIDGE_ERROR_TYPES.REPLACEMENT_REJECTED,
+        cancelled: true,
+        needsApproval: true,
+        error: "Structure replacement was declined by user.",
+      },
+    },
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: fallbackCallAI,
+    fetchImpl: failingFetch,
+  });
+
+  assert(/declined by the user/i.test(declinedRes.reply), "Fallback summary truthfully reports user declined replacement");
+  assert(/unchanged/i.test(declinedRes.reply), "Fallback summary confirms current drawing was kept unchanged");
+  assert(!/loaded structure into the molecular editor/i.test(declinedRes.reply), "Never claims structure was loaded when declined");
+
+  // Turn 2b: Standalone chat (editor_unavailable) + AI provider fails on continuation
+  const { fetchImpl: fRead } = mockOpenRouter([
+    toolCall("c_read_standalone", "read_editor_structure", {}),
+  ]);
+  const suspendedRead = await runAgent({
+    message: "What is on my canvas?",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: fRead,
+  });
+
+  const unavailRes = await runAgent({
+    continuationToken: suspendedRead.continuationToken,
+    clientActionResult: {
+      id: suspendedRead.actionRequest.id,
+      tool: suspendedRead.actionRequest.tool,
+      result: {
+        ok: false,
+        errorType: BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE,
+        unavailable: true,
+        error: "The molecular editor is not currently active on this page.",
+      },
+    },
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: fallbackCallAI,
+    fetchImpl: failingFetch,
+  });
+
+  assert(/not open on this page/i.test(unavailRes.reply) && /\/editor/.test(unavailRes.reply), "Standalone chat fallback directs user to /editor");
+}
+
+/* 20. Phase 2C: Duplicate client tool call after failure is blocked (no duplicate mutations) */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  const { fetchImpl: f1 } = mockOpenRouter([
+    toolCall("c_load_dup_1", "load_structure_into_editor", { smiles: "c1ccccc1" }),
+  ]);
+  const suspended = await runAgent({
+    message: "Draw benzene",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: f1,
+  });
+
+  // Model stubbornly tries to call the exact same load_structure_into_editor again after user declined
+  const { fetchImpl: f2 } = mockOpenRouter([
+    toolCall("c_load_dup_2", "load_structure_into_editor", { smiles: "c1ccccc1" }),
+    { content: "You declined replacing the structure, so I left your canvas as is." },
+  ]);
+
+  const completed = await runAgent({
+    continuationToken: suspended.continuationToken,
+    clientActionResult: {
+      id: suspended.actionRequest.id,
+      tool: suspended.actionRequest.tool,
+      result: {
+        ok: false,
+        errorType: BRIDGE_ERROR_TYPES.REPLACEMENT_REJECTED,
+        cancelled: true,
+        error: "Structure replacement was declined by user.",
+      },
+    },
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: f2,
+  });
+
+  assert(completed.status !== "action_required", "Duplicate failed client tool call is not re-dispatched to client");
+  assert(completed.agent.toolCalls.length === 2 && completed.agent.toolCalls[1].rejected === true, "Second identical client call is rejected in trace");
+  assert(completed.reply.includes("left your canvas as is"), "Agent finishes with explanation instead of re-prompting user");
+}
+
+/* 21. Phase 2C: /api/chat route returns structured error code and HTTP status when AI fails */
+{
+  _resetCapabilityCache();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/endpoints")) {
+      return new Response(JSON.stringify({ data: { endpoints: [{ supported_parameters: ["tools"] }] } }), { status: 200 });
+    }
+    return new Response("Service Unavailable", { status: 503 });
+  };
+  try {
+    const req = new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Load caffeine into the editor" }),
+    });
+    const res = await onRequest({ request: req, env: ENV });
+    const data = await res.json();
+    assert(res.status === 502, "/api/chat returns 502 when all AI providers fail");
+    assert(data.code === AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, "/api/chat response includes code: ai_provider_unavailable");
+    assert(/drawing was not changed/i.test(data.error), "/api/chat error truthfully states no editor action was performed");
+
+    // Continuation with mismatched action id returns 400 invalid_continuation
+    const token = createContinuationToken({
+      message: "test",
+      pendingCall: { id: "expected_id", name: "read_editor_structure", parsedArguments: {} },
+    });
+    const badContReq = new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        continuationToken: token,
+        clientActionResult: { id: "wrong_id", tool: "read_editor_structure", result: { ok: true } },
+      }),
+    });
+    const badContRes = await onRequest({ request: badContReq, env: ENV });
+    const badContData = await badContRes.json();
+    assert(badContRes.status === 400 && badContData.code === AGENT_ERROR_TYPES.INVALID_CONTINUATION, "Mismatched continuation action id rejected with 400 invalid_continuation");
+  } finally {
+    globalThis.fetch = realFetch;
   }
 }
 

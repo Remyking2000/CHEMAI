@@ -17,23 +17,34 @@
  * ==============================================================================
  */
 
-import { ALLOWED_BRIDGE_ACTIONS, getActiveEditorBridge } from "./editorBridge.js";
+import { ALLOWED_BRIDGE_ACTIONS, BRIDGE_ERROR_TYPES, getActiveEditorBridge } from "./editorBridge.js";
 import { API_ROUTES } from "../config/api.js";
 
 const MAX_HANDSHAKE_TURNS = 6;
+
+function inferClientErrorType(res) {
+  if (res.errorType) return res.errorType;
+  if (res.unavailable) return BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE;
+  if (res.cancelled || (res.needsApproval && !res.ok)) return BRIDGE_ERROR_TYPES.REPLACEMENT_REJECTED;
+  if (typeof res.error === "string" && /invalid smiles|empty structure|non-empty smiles/i.test(res.error)) {
+    return BRIDGE_ERROR_TYPES.INVALID_STRUCTURE;
+  }
+  return BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED;
+}
 
 /**
  * Executes an allowlisted client tool against the active editor bridge.
  *
  * @param {string} actionName - Name of the bridge action
  * @param {object} params - Action parameters
- * @returns {Promise<{ok: boolean, data?: object, error?: string, unavailable?: boolean, cancelled?: boolean, needsApproval?: boolean}>}
+ * @returns {Promise<{ok: boolean, data?: object, error?: string, errorType?: string, unavailable?: boolean, cancelled?: boolean, needsApproval?: boolean}>}
  */
 export async function executeClientTool(actionName, params = {}) {
   // 1. Strict allowlist validation
   if (typeof actionName !== "string" || !ALLOWED_BRIDGE_ACTIONS.includes(actionName)) {
     return {
       ok: false,
+      errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
       error: `Action "${String(actionName)}" is not an allowlisted client editor operation.`,
     };
   }
@@ -43,6 +54,7 @@ export async function executeClientTool(actionName, params = {}) {
   if (!bridge) {
     return {
       ok: false,
+      errorType: BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE,
       error: "The molecular editor is not currently active on this page. Please open the Molecular Editor at /editor to perform canvas operations.",
       unavailable: true,
     };
@@ -52,18 +64,28 @@ export async function executeClientTool(actionName, params = {}) {
   try {
     const res = await bridge.executeAction(actionName, params);
     if (!res || typeof res !== "object") {
-      return { ok: false, error: "Editor bridge returned an empty or invalid result." };
+      return {
+        ok: false,
+        errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
+        error: "Editor bridge returned an empty or invalid result.",
+      };
     }
+    const ok = Boolean(res.ok);
+    const cancelled = Boolean(res.cancelled || (res.needsApproval && !ok && res.errorType !== BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED));
+    const unavailable = Boolean(res.unavailable || res.errorType === BRIDGE_ERROR_TYPES.EDITOR_UNAVAILABLE);
     return {
-      ok: Boolean(res.ok),
+      ok,
       data: res.data,
       error: res.error,
+      ...(ok ? {} : { errorType: inferClientErrorType(res) }),
+      ...(unavailable ? { unavailable: true } : {}),
       needsApproval: Boolean(res.needsApproval),
-      cancelled: Boolean(res.needsApproval && !res.ok),
+      cancelled,
     };
   } catch (err) {
     return {
       ok: false,
+      errorType: BRIDGE_ERROR_TYPES.EDITOR_OPERATION_FAILED,
       error: err?.message || "Unexpected exception during client editor tool execution.",
     };
   }
@@ -116,7 +138,11 @@ export async function sendAgentChat({
 
     if (!res.ok) {
       const detail = data?.details ? ` (${data.details})` : "";
-      throw new Error(data?.error ? `${data.error}${detail}` : `Server returned HTTP ${res.status}`);
+      const err = new Error(data?.error ? `${data.error}${detail}` : `Server returned HTTP ${res.status}`);
+      err.code = data?.code || null;
+      err.status = res.status;
+      err.details = data?.details || null;
+      throw err;
     }
 
     // Check if the agent requires a client editor tool to be executed

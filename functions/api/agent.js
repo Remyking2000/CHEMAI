@@ -43,6 +43,74 @@ export const AGENT_LIMITS = Object.freeze({
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
 
 /* -------------------------------------------------------------------------- */
+/* Structured error taxonomy (Phase 2C)                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Failure categories surfaced to the API response (`code`), the agent trace
+ * (`errorType`) and deterministic user-facing summaries. Editor categories are
+ * produced by the client bridge; AI categories are produced by the agent loop.
+ */
+export const AGENT_ERROR_TYPES = Object.freeze({
+  AI_PROVIDER_UNAVAILABLE: "ai_provider_unavailable",
+  AI_TIMEOUT: "ai_timeout",
+  AI_INVALID_RESPONSE: "ai_invalid_response",
+  INVALID_STRUCTURE: "invalid_structure",
+  EDITOR_UNAVAILABLE: "editor_unavailable",
+  REPLACEMENT_REJECTED: "replacement_rejected",
+  EDITOR_OPERATION_FAILED: "editor_operation_failed",
+  INVALID_CONTINUATION: "invalid_continuation",
+});
+
+const CLIENT_ERROR_TYPES = new Set([
+  AGENT_ERROR_TYPES.INVALID_STRUCTURE,
+  AGENT_ERROR_TYPES.EDITOR_UNAVAILABLE,
+  AGENT_ERROR_TYPES.REPLACEMENT_REJECTED,
+  AGENT_ERROR_TYPES.EDITOR_OPERATION_FAILED,
+]);
+
+const AGENT_ERROR_MESSAGES = Object.freeze({
+  [AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE]:
+    "The AI service is currently unavailable, so your request could not be processed. No editor actions were performed and your drawing was not changed. Please try again in a moment.",
+  [AGENT_ERROR_TYPES.AI_TIMEOUT]:
+    "The AI service did not respond within the time limit, so your request could not be processed. No editor actions were performed and your drawing was not changed. Please try again.",
+  [AGENT_ERROR_TYPES.AI_INVALID_RESPONSE]:
+    "The AI service returned an invalid response, so your request could not be processed. No editor actions were performed and your drawing was not changed. Please try again.",
+  [AGENT_ERROR_TYPES.INVALID_CONTINUATION]:
+    "The editor action could not be resumed. No further changes were made. Please resend your message.",
+});
+
+const AGENT_ERROR_STATUS = Object.freeze({
+  [AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE]: 502,
+  [AGENT_ERROR_TYPES.AI_TIMEOUT]: 504,
+  [AGENT_ERROR_TYPES.AI_INVALID_RESPONSE]: 502,
+  [AGENT_ERROR_TYPES.INVALID_CONTINUATION]: 400,
+});
+
+/** Error thrown by runAgent when a request cannot be completed truthfully. */
+export class AgentError extends Error {
+  constructor(type, details) {
+    super(AGENT_ERROR_MESSAGES[type] || "ChemAI agent could not complete the request.");
+    this.name = "AgentError";
+    this.type = type;
+    this.status = AGENT_ERROR_STATUS[type] || 502;
+    this.details = details ? sanitizeText(String(details)) : undefined;
+  }
+}
+
+function isTimeoutError(err) {
+  return Boolean(err && (err.code === "TIMEOUT" || err.name === "AbortError" || /timed out/i.test(err.message || "")));
+}
+
+/** Picks the most specific category for a list of per-attempt AI failures. */
+function summarizeAiFailures(failures) {
+  if (!failures.length) return { type: AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, details: "No AI provider responded." };
+  const types = new Set(failures.map((f) => f.type));
+  const type = types.size === 1 ? failures[0].type : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE;
+  return { type, details: failures.map((f) => f.detail).filter(Boolean).join("; ").slice(0, 500) };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Utilities                                                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -73,7 +141,11 @@ function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms);
+      timer = setTimeout(() => {
+        const err = new Error(`${label} timed out after ${ms} ms`);
+        err.code = "TIMEOUT";
+        reject(err);
+      }, ms);
     }),
   ]).finally(() => clearTimeout(timer));
 }
@@ -568,7 +640,8 @@ TOOL USE POLICY (you decide):
 - If a client editor tool reports that the editor is unavailable (e.g. user is in standalone chat without an active editor), clearly explain that no editor is currently open on this page and answer conceptually or suggest opening the Molecular Editor at /editor.
 - If a client editor tool reports that structure replacement was declined or cancelled by the user, respect their decision and explain what was kept.
 - If read_editor_structure reports an empty canvas (0 atoms), inform the user that the canvas is currently blank.
-- If a tool fails, try one reasonable alternative or explain the limitation. Never repeat an identical failed call.`;
+- If a tool fails, try one reasonable alternative or explain the limitation. Never repeat an identical failed call.
+- Never state or imply that an editor action (loading, reading, centering) was performed unless a client editor tool result in this conversation reports ok: true for it. If an editor tool failed, say so plainly, give the reported reason (errorType/error), and do not retry an editor action that changes the drawing.`;
 
   if (mode === "structured") {
     const toolLines = [...registry.values()]
@@ -616,6 +689,7 @@ function serializeToolResult(step) {
     ok: step.result.ok,
     provenance: step.result.provenance,
     ...(step.result.ok ? { data: step.result.data } : { error: step.result.error }),
+    ...(step.result.errorType ? { errorType: step.result.errorType } : {}),
     ...(step.result.note ? { note: step.result.note } : {}),
   };
   return truncate(JSON.stringify(payload), AGENT_LIMITS.MAX_TOOL_RESULT_CHARS);
@@ -743,7 +817,7 @@ function buildNativeMessages({ systemPrompt, history, message, steps, forceFinal
   return messages;
 }
 
-async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, message, steps, forceFinal, now, deadline, limits }) {
+async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, message, steps, forceFinal, now, deadline, limits, failures }) {
   const key = openRouterKey(env);
   if (!key) return null;
   const tools = toOpenAITools(registry);
@@ -784,12 +858,32 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
         const errText = await withTimeout(res.text(), 3000, "error body").catch(() => "");
         if ((res.status === 400 || res.status === 404) && /tool/i.test(errText)) {
           capabilityCache.set(model, { supported: false, at: now() });
+        } else {
+          failures?.push({
+            type: res.status === 408 || res.status === 504 ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+            detail: `OpenRouter (${model}) HTTP ${res.status}`,
+          });
         }
         continue;
       }
-      const data = await withTimeout(res.json(), Math.max(2000, deadline - now()), `OpenRouter body (${model})`);
+      let data;
+      try {
+        data = await withTimeout(res.json(), Math.max(2000, deadline - now()), `OpenRouter body (${model})`);
+      } catch (bodyErr) {
+        failures?.push({
+          type: isTimeoutError(bodyErr) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_INVALID_RESPONSE,
+          detail: `OpenRouter (${model}) response body: ${sanitizeText(bodyErr?.message)}`,
+        });
+        continue;
+      }
       const msg = data?.choices?.[0]?.message;
-      if (!msg) continue;
+      if (!msg || typeof msg !== "object") {
+        failures?.push({
+          type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE,
+          detail: `OpenRouter (${model}) returned no choices[0].message.`,
+        });
+        continue;
+      }
       if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
         return {
           type: "tool_calls",
@@ -806,8 +900,23 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
       if (typeof msg.content === "string" && msg.content.trim()) {
         return { type: "final", text: msg.content.trim(), provider: "openrouter", model };
       }
+      failures?.push({
+        type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE,
+        detail: `OpenRouter (${model}) returned an empty completion.`,
+      });
     } catch (err) {
-      capabilityCache.set(model, { supported: false, at: now() });
+      if (isTimeoutError(err)) {
+        failures?.push({
+          type: AGENT_ERROR_TYPES.AI_TIMEOUT,
+          detail: `OpenRouter (${model}) timed out.`,
+        });
+      } else {
+        capabilityCache.set(model, { supported: false, at: now() });
+        failures?.push({
+          type: AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+          detail: `OpenRouter (${model}): ${sanitizeText(err?.message)}`,
+        });
+      }
       console.warn(`[ChemAI Agent] native call (${model}) failed:`, sanitizeText(err?.message));
     } finally {
       if (timer) clearTimeout(timer);
@@ -820,7 +929,7 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
 /* Structured fallback adapter (uses the existing callAI gateway)             */
 /* -------------------------------------------------------------------------- */
 
-async function structuredNext({ env, callAI, systemPrompt, history, message, steps, forceFinal, now, deadline, limits }) {
+async function structuredNext({ env, callAI, systemPrompt, history, message, steps, forceFinal, now, deadline, limits, failures }) {
   const remaining = deadline - now();
   if (remaining < limits.MIN_MODEL_CALL_MS) return { type: "budget_exhausted" };
   const convo = [...history];
@@ -841,22 +950,105 @@ async function structuredNext({ env, callAI, systemPrompt, history, message, ste
       : "\n\nUsing this result, either call another tool (JSON only) or reply with your final answer in plain Markdown.";
   }
 
-  const ai = await withTimeout(
-    callAI({ prompt, history: convo, systemPrompt, env }),
-    remaining,
-    "AI provider"
-  );
-  // The deterministic last-resort responder cannot reason over tool results.
-  if (ai?.provider === "chemai-assistant" && steps.length) {
-    return { type: "final", text: summarizeSteps(steps, "ai_unavailable"), provider: ai.provider, model: ai.model };
+  let ai;
+  try {
+    ai = await withTimeout(
+      callAI({ prompt, history: convo, systemPrompt, env }),
+      remaining,
+      "AI provider"
+    );
+  } catch (err) {
+    const type = isTimeoutError(err) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE;
+    failures?.push({ type, detail: sanitizeText(err?.message) });
+    const summary = summarizeAiFailures(failures || [{ type, detail: err?.message }]);
+    throw new AgentError(summary.type, summary.details);
   }
-  const parsed = forceFinal ? { type: "final", text: (ai?.text || "").trim() } : parseStructuredAction(ai?.text || "");
+
+  if (Array.isArray(ai?.diagnostics)) {
+    for (const d of ai.diagnostics) {
+      if (d && d.type) failures?.push(d);
+    }
+  }
+
+  // The deterministic last-resort responder cannot call tools or reason over tool results.
+  if (ai?.provider === "chemai-assistant") {
+    if (steps.length) {
+      return { type: "final", text: summarizeSteps(steps, "ai_unavailable"), provider: ai.provider, model: ai.model };
+    }
+    const summary = summarizeAiFailures(failures || []);
+    throw new AgentError(summary.type, summary.details);
+  }
+
+  const rawText = typeof ai?.text === "string" ? ai.text.trim() : "";
+  if (!rawText) {
+    failures?.push({ type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, detail: "AI provider returned an empty response." });
+    const summary = summarizeAiFailures(failures || []);
+    throw new AgentError(summary.type, summary.details);
+  }
+
+  const parsed = forceFinal ? { type: "final", text: rawText } : parseStructuredAction(rawText);
   return { ...parsed, provider: ai?.provider, model: ai?.model };
 }
 
 /* -------------------------------------------------------------------------- */
 /* Fallback summary when the loop cannot reach a model-written final answer   */
 /* -------------------------------------------------------------------------- */
+
+function classifyClientFailure(resPayload) {
+  if (!resPayload || resPayload.ok) return undefined;
+  if (typeof resPayload.errorType === "string" && CLIENT_ERROR_TYPES.has(resPayload.errorType)) {
+    return resPayload.errorType;
+  }
+  if (resPayload.unavailable) return AGENT_ERROR_TYPES.EDITOR_UNAVAILABLE;
+  if (resPayload.cancelled || resPayload.needsApproval) return AGENT_ERROR_TYPES.REPLACEMENT_REJECTED;
+  if (typeof resPayload.error === "string" && /invalid smiles|empty structure|non-empty smiles|unsupported characters/i.test(resPayload.error)) {
+    return AGENT_ERROR_TYPES.INVALID_STRUCTURE;
+  }
+  return AGENT_ERROR_TYPES.EDITOR_OPERATION_FAILED;
+}
+
+function describeClientStep(step) {
+  const r = step.result || {};
+  const d = r.data || {};
+  if (r.ok) {
+    if (step.name === "read_editor_structure") {
+      if (d.isEmpty || d.atomCount === 0) {
+        return "- **read_editor_structure**: read the editor canvas — the canvas is currently blank (0 atoms).";
+      }
+      const parts = [
+        d.smiles && `SMILES \`${d.smiles}\``,
+        d.formula && `formula ${d.formula}`,
+        typeof d.atomCount === "number" && `${d.atomCount} atom(s)`,
+      ].filter(Boolean);
+      return `- **read_editor_structure**: read structure from the editor canvas (${parts.join(", ") || "non-empty"}).`;
+    }
+    if (step.name === "load_structure_into_editor") {
+      const parts = [
+        d.smiles && `SMILES \`${d.smiles}\``,
+        d.formula && `formula ${d.formula}`,
+        typeof d.atomCount === "number" && `${d.atomCount} atom(s)`,
+      ].filter(Boolean);
+      return `- **load_structure_into_editor**: loaded structure into the molecular editor (${parts.join(", ") || "confirmed"}).`;
+    }
+    if (step.name === "fit_canvas_view") {
+      return "- **fit_canvas_view**: centered and framed the canvas view.";
+    }
+    if (step.name === "get_editor_capabilities") {
+      return `- **get_editor_capabilities**: editor mode \`${d.viewMode || "unknown"}\`, ready: ${Boolean(d.isReady)}.`;
+    }
+  }
+  const errType = r.errorType;
+  if (errType === AGENT_ERROR_TYPES.EDITOR_UNAVAILABLE || r.unavailable) {
+    return `- **${step.name}**: could not be completed because the molecular editor is not open on this page. Please open the **Molecular Editor** at \`/editor\` to perform canvas operations.`;
+  }
+  if (errType === AGENT_ERROR_TYPES.REPLACEMENT_REJECTED || r.cancelled) {
+    return `- **${step.name}**: structure replacement was declined by the user. Your current drawing was kept unchanged.`;
+  }
+  if (errType === AGENT_ERROR_TYPES.INVALID_STRUCTURE) {
+    return `- **${step.name}**: rejected invalid chemical structure (${r.error || "invalid SMILES"}). Your current drawing was not changed.`;
+  }
+  return `- **${step.name}**: editor operation could not be completed — ${r.error || "unexpected editor error"} Your current drawing was not changed.`;
+}
 
 function summarizeSteps(steps, reason) {
   const header =
@@ -866,6 +1058,9 @@ function summarizeSteps(steps, reason) {
       ? "I ran out of time for this request. Here is what I completed:"
       : "I reached the tool-use limit for this request before completing the analysis. Here is what I completed:";
   const lines = steps.map((s) => {
+    if (s.result?.provenance === "client_editor_bridge") {
+      return describeClientStep(s);
+    }
     const args = s.parsedArguments ? JSON.stringify(s.parsedArguments) : "";
     if (!s.result.ok) return `- **${s.name}** ${args}: failed — ${s.result.error}`;
     const d = s.result.data || {};
@@ -918,7 +1113,12 @@ export async function runAgent({
   let iterations = 0;
 
   if (continuationToken) {
-    const tokenData = decodeContinuationToken(continuationToken);
+    let tokenData;
+    try {
+      tokenData = decodeContinuationToken(continuationToken);
+    } catch (err) {
+      throw new AgentError(AGENT_ERROR_TYPES.INVALID_CONTINUATION, err?.message);
+    }
     userMessage = tokenData.message || userMessage;
     convHistory = Array.isArray(tokenData.history) ? tokenData.history : convHistory;
     activeCompound = tokenData.compound !== undefined ? tokenData.compound : activeCompound;
@@ -929,41 +1129,58 @@ export async function runAgent({
     mode = tokenData.mode || mode;
     if (typeof tokenData.started === "number") started = tokenData.started;
 
-    if (clientActionResult && tokenData.pendingCall) {
-      const pending = tokenData.pendingCall;
-      const resPayload = clientActionResult.result || {};
-      const isOk = Boolean(resPayload.ok);
-      const toolResult = {
-        ok: isOk,
-        provenance: "client_editor_bridge",
-        ...(isOk ? { data: resPayload.data || {} } : { error: sanitizeText(resPayload.error || "Client tool execution failed.") }),
-        ...(resPayload.cancelled ? { cancelled: true } : {}),
-        ...(resPayload.unavailable ? { unavailable: true } : {}),
-        ...(resPayload.needsApproval ? { needsApproval: true } : {}),
-      };
-
-      steps.push({
-        turn: iterations,
-        id: pending.id,
-        name: pending.name,
-        rawArguments: pending.rawArguments,
-        parsedArguments: pending.parsedArguments,
-        assistantContent: pending.assistantContent || "",
-        result: toolResult,
-      });
-
-      trace.push({
-        name: pending.name,
-        arguments: pending.parsedArguments,
-        ok: isOk,
-        rejected: Boolean(resPayload.rejected),
-        error: isOk ? undefined : sanitizeText(resPayload.error || "Client tool execution failed."),
-        provenance: "client_editor_bridge",
-        durationMs: 0,
-      });
-
-      console.info(`[ChemAI Agent] client_tool=${pending.name} ok=${isOk}`);
+    if (!tokenData.pendingCall || !clientActionResult || typeof clientActionResult !== "object") {
+      throw new AgentError(
+        AGENT_ERROR_TYPES.INVALID_CONTINUATION,
+        "Continuation is missing the client action result for the pending tool call."
+      );
     }
+    const pending = tokenData.pendingCall;
+    if (
+      (clientActionResult.id && clientActionResult.id !== pending.id) ||
+      (clientActionResult.tool && clientActionResult.tool !== pending.name)
+    ) {
+      throw new AgentError(
+        AGENT_ERROR_TYPES.INVALID_CONTINUATION,
+        "Client action result does not match the pending tool call."
+      );
+    }
+    const resPayload = clientActionResult.result || {};
+    const isOk = Boolean(resPayload.ok);
+    const errorType = isOk ? undefined : classifyClientFailure(resPayload);
+    const errorMsg = isOk ? undefined : sanitizeText(resPayload.error || "Client tool execution failed.");
+    const toolResult = {
+      ok: isOk,
+      provenance: "client_editor_bridge",
+      ...(isOk ? { data: resPayload.data || {} } : { error: errorMsg }),
+      ...(errorType ? { errorType } : {}),
+      ...(resPayload.cancelled ? { cancelled: true } : {}),
+      ...(resPayload.unavailable ? { unavailable: true } : {}),
+      ...(resPayload.needsApproval ? { needsApproval: true } : {}),
+    };
+
+    steps.push({
+      turn: iterations,
+      id: pending.id,
+      name: pending.name,
+      rawArguments: pending.rawArguments,
+      parsedArguments: pending.parsedArguments,
+      assistantContent: pending.assistantContent || "",
+      result: toolResult,
+    });
+
+    trace.push({
+      name: pending.name,
+      arguments: pending.parsedArguments,
+      ok: isOk,
+      rejected: Boolean(resPayload.rejected || errorType === AGENT_ERROR_TYPES.REPLACEMENT_REJECTED),
+      ...(errorType ? { errorType } : {}),
+      error: errorMsg,
+      provenance: "client_editor_bridge",
+      durationMs: 0,
+    });
+
+    console.info(`[ChemAI Agent] client_tool=${pending.name} ok=${isOk}${errorType ? ` errorType=${errorType}` : ""}`);
   }
 
   const deadline = started + limits.TOTAL_BUDGET_MS;
@@ -974,6 +1191,13 @@ export async function runAgent({
   let model = null;
   let reply = null;
   let stopReason = null;
+
+  // Populate failedSignatures from earlier steps (e.g. restored via continuationToken)
+  for (const s of steps) {
+    if (!s.result?.ok && s.parsedArguments && typeof s.parsedArguments === "object") {
+      failedSignatures.add(`${s.name}:${stableStringify(s.parsedArguments)}`);
+    }
+  }
 
   const executeCall = async (call) => {
     const t0 = now();
@@ -1046,7 +1270,8 @@ export async function runAgent({
     // Stop opening new tool rounds once only the final-answer reserve remains.
     const outOfTime = steps.length > 0 && deadline - now() < limits.FINAL_ANSWER_RESERVE_MS;
     const forceFinal = iterations >= limits.MAX_TOOL_ITERATIONS || outOfTime;
-    const shared = { env, fetchImpl, registry, history: convHistory, message: userMessage, steps, forceFinal, now, callAI, deadline, limits };
+    const failures = [];
+    const shared = { env, fetchImpl, registry, history: convHistory, message: userMessage, steps, forceFinal, now, callAI, deadline, limits, failures };
 
     let decision = null;
     if (mode === "native") {
@@ -1057,13 +1282,23 @@ export async function runAgent({
       try {
         decision = await structuredNext({ ...shared, systemPrompt: buildAgentSystemPrompt(activeCompound, registry, "structured") });
       } catch (err) {
-        if (!steps.length) throw err;
+        if (!steps.length) {
+          if (err instanceof AgentError) throw err;
+          const summary = summarizeAiFailures(
+            failures.length
+              ? failures
+              : [{ type: isTimeoutError(err) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, detail: err?.message }]
+          );
+          throw new AgentError(summary.type, summary.details);
+        }
         decision = { type: "final", text: summarizeSteps(steps, "ai_unavailable") };
       }
     }
 
     if (decision.type === "budget_exhausted") {
-      if (!steps.length) throw new Error("The AI model did not respond within the time limit. Please try again.");
+      if (!steps.length) {
+        throw new AgentError(AGENT_ERROR_TYPES.AI_TIMEOUT, "The AI model did not respond within the time limit.");
+      }
       reply = summarizeSteps(steps, "time_budget");
       stopReason = "time_budget";
       break;
@@ -1105,7 +1340,12 @@ export async function runAgent({
       // Check if this is a client-side tool
       if (tool && tool.runtime === "client") {
         if (parsedArguments === undefined) {
-          const result = { ok: false, rejected: true, error: "Tool arguments were not valid JSON." };
+          const result = {
+            ok: false,
+            rejected: true,
+            errorType: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE,
+            error: "Tool arguments were not valid JSON.",
+          };
           steps.push({
             turn: iterations,
             id,
@@ -1120,14 +1360,23 @@ export async function runAgent({
             arguments: parsedArguments ?? "{}",
             ok: false,
             rejected: true,
+            errorType: result.errorType,
             error: result.error,
             provenance: "client_editor_bridge",
             durationMs: 0,
           });
         } else {
           const v = validateArgs(tool.parameters, parsedArguments);
-          if (!v.ok) {
-            const result = { ok: false, rejected: true, error: `Invalid arguments: ${v.error}` };
+          const syntaxCheck = v.ok && tool.name === "load_structure_into_editor" ? checkSmilesSyntax(v.value.smiles) : { plausible: true };
+          if (!v.ok || !syntaxCheck.plausible) {
+            const errDetail = !v.ok ? v.error : `Invalid SMILES syntax: ${syntaxCheck.issues.join(" ")}`;
+            const errType = tool.name === "load_structure_into_editor" ? AGENT_ERROR_TYPES.INVALID_STRUCTURE : AGENT_ERROR_TYPES.AI_INVALID_RESPONSE;
+            const result = {
+              ok: false,
+              rejected: true,
+              errorType: errType,
+              error: `Invalid arguments: ${errDetail}`,
+            };
             steps.push({
               turn: iterations,
               id,
@@ -1142,38 +1391,66 @@ export async function runAgent({
               arguments: parsedArguments,
               ok: false,
               rejected: true,
+              errorType: errType,
               error: result.error,
               provenance: "client_editor_bridge",
               durationMs: 0,
             });
           } else {
-            // Client tool validated! Pause execution and request action from client
-            return {
-              status: "action_required",
-              actionRequest: {
+            const sig = `${tool.name}:${stableStringify(v.value)}`;
+            if (failedSignatures.has(sig)) {
+              const result = {
+                ok: false,
+                rejected: true,
+                error: "This identical editor action already failed or was declined in this request. Do not repeat it; explain the outcome to the user.",
+              };
+              steps.push({
+                turn: iterations,
                 id,
-                tool: tool.name,
+                name: call.name,
+                rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(v.value),
+                parsedArguments: v.value,
+                assistantContent: decision.content || "",
+                result,
+              });
+              trace.push({
+                name: String(call.name || "").slice(0, 60),
                 arguments: v.value,
-              },
-              continuationToken: createContinuationToken({
-                sessionId: activeSessionId,
-                message: userMessage,
-                compound: activeCompound,
-                history: convHistory,
-                steps,
-                trace,
-                pendingCall: {
+                ok: false,
+                rejected: true,
+                error: result.error,
+                provenance: "client_editor_bridge",
+                durationMs: 0,
+              });
+            } else {
+              // Client tool validated! Pause execution and request action from client
+              return {
+                status: "action_required",
+                actionRequest: {
                   id,
-                  name: tool.name,
-                  rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(v.value),
-                  parsedArguments: v.value,
-                  assistantContent: decision.content || "",
+                  tool: tool.name,
+                  arguments: v.value,
                 },
-                iterations,
-                mode,
-                started,
-              }),
-            };
+                continuationToken: createContinuationToken({
+                  sessionId: activeSessionId,
+                  message: userMessage,
+                  compound: activeCompound,
+                  history: convHistory,
+                  steps,
+                  trace,
+                  pendingCall: {
+                    id,
+                    name: tool.name,
+                    rawArguments: typeof call.rawArguments === "string" ? call.rawArguments : JSON.stringify(v.value),
+                    parsedArguments: v.value,
+                    assistantContent: decision.content || "",
+                  },
+                  iterations,
+                  mode,
+                  started,
+                }),
+              };
+            }
           }
         }
       } else {
@@ -1197,7 +1474,7 @@ export async function runAgent({
   }
 
   if (!reply || !reply.trim()) {
-    throw new Error("The AI model returned an empty response.");
+    throw new AgentError(AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, "The AI model returned an empty response.");
   }
 
   return {

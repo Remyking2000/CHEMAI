@@ -6,7 +6,7 @@
  * ==============================================================================
  */
 
-import { runAgent, createToolRegistry, AGENT_LIMITS } from "./agent.js";
+import { runAgent, createToolRegistry, AGENT_LIMITS, AGENT_ERROR_TYPES, AgentError } from "./agent.js";
 
 // Helper to return JSON responses with CORS headers
 function jsonResponse(data, status = 200, headers = {}) {
@@ -597,10 +597,17 @@ async function handleChat(request, env) {
         callAI,
       });
     } catch (err) {
-      console.error("[ChemAI Agent Error]:", sanitizeError(err?.message));
+      console.error("[ChemAI Agent Error]:", sanitizeError(err?.message), err?.details || "");
+      const status = err instanceof AgentError ? err.status : 502;
+      const code = err instanceof AgentError ? err.type : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE;
+      const errorMsg = err instanceof AgentError ? err.message : "ChemAI agent could not complete the request.";
       return jsonResponse(
-        { error: "ChemAI agent could not complete the request.", details: sanitizeError(err?.message) },
-        502
+        {
+          error: errorMsg,
+          code,
+          details: sanitizeError(err?.details || err?.message),
+        },
+        status
       );
     }
 
@@ -836,11 +843,19 @@ async function fetchJsonWithTimeout(url, options, timeoutMs = 8000) {
   try {
     const res = await fetch(url, controller ? { ...options, signal: controller.signal } : options);
     if (!res.ok) return { ok: false, status: res.status, data: null };
-    const data = await res.json();
-    return { ok: true, status: res.status, data };
+    try {
+      const data = await res.json();
+      return { ok: true, status: res.status, data };
+    } catch (parseErr) {
+      return { ok: false, status: res.status, data: null, invalidJson: true, error: parseErr.message };
+    }
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function isAbortOrTimeout(err) {
+  return Boolean(err && (err.name === "AbortError" || err.code === "TIMEOUT" || /abort|timed out/i.test(err.message || "")));
 }
 
 async function callAI({ prompt, history = [], systemPrompt = "", env }) {
@@ -850,6 +865,7 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
   const hasValidOpenRouter = Boolean(openRouterKey && !openRouterKey.startsWith("your_"));
   const hasValidGemini = Boolean(geminiKey && !geminiKey.startsWith("your_"));
   const preferGemini = env.AI_PROVIDER === "gemini" && hasValidGemini;
+  const diagnostics = [];
 
   const messages = [];
   if (systemPrompt) {
@@ -901,11 +917,25 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
       if (gRes.ok) {
         const gData = gRes.data;
         const replyText = gData?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (replyText) {
+        if (replyText && replyText.trim()) {
           return { text: replyText, provider: "gemini", model };
         }
+        diagnostics.push({ type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, detail: `Gemini (${model}) returned empty content.` });
+      } else {
+        diagnostics.push({
+          type: gRes.invalidJson
+            ? AGENT_ERROR_TYPES.AI_INVALID_RESPONSE
+            : gRes.status === 408 || gRes.status === 504
+            ? AGENT_ERROR_TYPES.AI_TIMEOUT
+            : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+          detail: `Gemini (${model}) HTTP ${gRes.status}`,
+        });
       }
     } catch (err) {
+      diagnostics.push({
+        type: isAbortOrTimeout(err) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+        detail: `Gemini: ${sanitizeError(err.message)}`,
+      });
       console.warn("[Edge AI] Gemini fallback triggered:", sanitizeError(err.message));
     }
   }
@@ -944,11 +974,25 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
         if (oRes.ok) {
           const oData = oRes.data;
           const replyText = oData?.choices?.[0]?.message?.content;
-          if (replyText) {
+          if (replyText && replyText.trim()) {
             return { text: replyText, provider: "openrouter", model };
           }
+          diagnostics.push({ type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, detail: `OpenRouter (${model}) returned empty content.` });
+        } else {
+          diagnostics.push({
+            type: oRes.invalidJson
+              ? AGENT_ERROR_TYPES.AI_INVALID_RESPONSE
+              : oRes.status === 408 || oRes.status === 504
+              ? AGENT_ERROR_TYPES.AI_TIMEOUT
+              : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+            detail: `OpenRouter (${model}) HTTP ${oRes.status}`,
+          });
         }
       } catch (err) {
+        diagnostics.push({
+          type: isAbortOrTimeout(err) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+          detail: `OpenRouter (${model}): ${sanitizeError(err.message)}`,
+        });
         console.warn(`[Edge AI] OpenRouter (${model}) fallback triggered:`, sanitizeError(err.message));
       }
     }
@@ -975,7 +1019,12 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
         if (replyText && replyText.trim()) {
           return { text: replyText.trim(), provider: "cloudflare-ai", model: cfModel };
         }
+        diagnostics.push({ type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, detail: `Cloudflare AI (${cfModel}) returned empty content.` });
       } catch (err) {
+        diagnostics.push({
+          type: isAbortOrTimeout(err) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+          detail: `Cloudflare AI (${cfModel}): ${sanitizeError(err.message)}`,
+        });
         console.warn(`[Edge AI] Cloudflare AI (${cfModel}) fallback triggered:`, err.message);
       }
     }
@@ -1011,17 +1060,32 @@ async function callAI({ prompt, history = [], systemPrompt = "", env }) {
           model: env.OPENROUTER_MODEL || "liquid/lfm-2.5-2.6b:free",
         };
       }
+      diagnostics.push({ type: AGENT_ERROR_TYPES.AI_INVALID_RESPONSE, detail: "Keyless LLM returned empty content." });
+    } else {
+      diagnostics.push({
+        type: pRes.invalidJson
+          ? AGENT_ERROR_TYPES.AI_INVALID_RESPONSE
+          : pRes.status === 408 || pRes.status === 504
+          ? AGENT_ERROR_TYPES.AI_TIMEOUT
+          : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+        detail: `Keyless LLM HTTP ${pRes.status}`,
+      });
     }
   } catch (err) {
+    diagnostics.push({
+      type: isAbortOrTimeout(err) ? AGENT_ERROR_TYPES.AI_TIMEOUT : AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE,
+      detail: `Keyless LLM: ${sanitizeError(err.message)}`,
+    });
     console.warn("[Edge AI] Keyless LLM fallback notice:", err.message);
   }
 
-  // 5. Dynamic PubChem + Cheminformatics Knowledge Engine (guaranteed rich response)
+  // 5. Dynamic PubChem + Cheminformatics Knowledge Engine (last-resort non-LLM responder)
   const dynamicReply = await buildFallbackChemistryResponse(prompt, systemPrompt);
   return {
     text: dynamicReply,
     provider: "chemai-assistant",
     model: env.OPENROUTER_MODEL || "liquid/lfm-2.5-2.6b:free",
+    diagnostics,
   };
 }
 
