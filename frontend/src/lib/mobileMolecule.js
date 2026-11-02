@@ -762,4 +762,559 @@ export function computeViewportTransform(mol, width, height, options = {}) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase 3A: Molecular Identity Resolution & Transactional Validation */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Checks whether an identifier is a valid positive integer entity ID.
+ */
+export function isValidEntityId(id) {
+  return typeof id === "number" && Number.isInteger(id) && id > 0;
+}
+
+/**
+ * Produces a deep, normalized copy of a molecule graph without mutating the source.
+ */
+export function cloneMolecule(mol) {
+  if (!mol || typeof mol !== "object") {
+    return { atoms: [], bonds: [] };
+  }
+  const atoms = Array.isArray(mol.atoms)
+    ? mol.atoms.map((a) => ({
+        id: a.id,
+        x: a.x,
+        y: a.y,
+        el: a.el || a.element || "C",
+        charge: Number(a.charge) || 0,
+      }))
+    : [];
+  const bonds = Array.isArray(mol.bonds)
+    ? mol.bonds.map((b) => ({
+        id: b.id,
+        a: b.a ?? b.a1,
+        b: b.b ?? b.a2,
+        order: b.order,
+      }))
+    : [];
+  return { atoms, bonds };
+}
+
+/**
+ * Resolves a single atom by its stable integer ID in the given molecule.
+ */
+export function resolveAtom(mol, atomId) {
+  if (!mol || !Array.isArray(mol.atoms)) {
+    return {
+      ok: false,
+      code: "empty_canvas",
+      error: "Molecular graph is empty or unavailable.",
+    };
+  }
+  if (!isValidEntityId(atomId)) {
+    return {
+      ok: false,
+      code: "invalid_atom_id",
+      error: `Invalid atom ID "${String(atomId)}": atom ID must be a positive integer.`,
+    };
+  }
+  const atom = mol.atoms.find((a) => a.id === atomId);
+  if (!atom) {
+    return {
+      ok: false,
+      code: "unknown_atom_id",
+      error: `Atom ID ${atomId} does not exist in the current molecular structure.`,
+    };
+  }
+  return {
+    ok: true,
+    atom: {
+      ...atom,
+      el: atom.el || atom.element || "C",
+      charge: Number(atom.charge) || 0,
+    },
+  };
+}
+
+/**
+ * Resolves an existing bond by its stable integer bondId or by its endpoint atom IDs (atomId1, atomId2).
+ * If both bondId and endpoint atom IDs are provided, verifies that they refer to the same bond.
+ */
+export function resolveBond(mol, selector) {
+  if (!mol || !Array.isArray(mol.atoms) || !Array.isArray(mol.bonds)) {
+    return {
+      ok: false,
+      code: "empty_canvas",
+      error: "Molecular graph is empty or unavailable.",
+    };
+  }
+
+  const ref = typeof selector === "number" ? { bondId: selector } : selector || {};
+  const hasBondId = ref.bondId !== undefined && ref.bondId !== null;
+  const rawAtom1 = ref.atomId1 ?? ref.a ?? ref.a1;
+  const rawAtom2 = ref.atomId2 ?? ref.b ?? ref.a2;
+  const hasAtom1 = rawAtom1 !== undefined && rawAtom1 !== null;
+  const hasAtom2 = rawAtom2 !== undefined && rawAtom2 !== null;
+
+  if (!hasBondId && !hasAtom1 && !hasAtom2) {
+    return {
+      ok: false,
+      code: "missing_bond_target",
+      error: "A target bond must be specified by 'bondId' or by both 'atomId1' and 'atomId2'.",
+    };
+  }
+
+  if (hasAtom1 || hasAtom2) {
+    if (!hasAtom1 || !hasAtom2) {
+      return {
+        ok: false,
+        code: "invalid_atom_id",
+        error: "Both 'atomId1' and 'atomId2' must be provided when referencing a bond by its endpoint atoms.",
+      };
+    }
+    if (!isValidEntityId(rawAtom1)) {
+      return {
+        ok: false,
+        code: "invalid_atom_id",
+        error: `Invalid atomId1 "${String(rawAtom1)}": atom ID must be a positive integer.`,
+      };
+    }
+    if (!isValidEntityId(rawAtom2)) {
+      return {
+        ok: false,
+        code: "invalid_atom_id",
+        error: `Invalid atomId2 "${String(rawAtom2)}": atom ID must be a positive integer.`,
+      };
+    }
+    if (rawAtom1 === rawAtom2) {
+      return {
+        ok: false,
+        code: "self_bond",
+        error: `Self-bond attempt rejected: atomId1 and atomId2 cannot refer to the same atom (${rawAtom1}).`,
+      };
+    }
+  }
+
+  if (hasBondId) {
+    if (!isValidEntityId(ref.bondId)) {
+      return {
+        ok: false,
+        code: "invalid_bond_id",
+        error: `Invalid bond ID "${String(ref.bondId)}": bond ID must be a positive integer.`,
+      };
+    }
+    const bond = mol.bonds.find((b) => b.id === ref.bondId);
+    if (!bond) {
+      return {
+        ok: false,
+        code: "unknown_bond_id",
+        error: `Bond ID ${ref.bondId} does not exist in the current molecular structure.`,
+      };
+    }
+    const endA = bond.a ?? bond.a1;
+    const endB = bond.b ?? bond.a2;
+    const rA = resolveAtom(mol, endA);
+    if (!rA.ok) {
+      return {
+        ok: false,
+        code: "unknown_atom_id",
+        error: `Bond ID ${ref.bondId} references missing endpoint atom ${endA}.`,
+      };
+    }
+    const rB = resolveAtom(mol, endB);
+    if (!rB.ok) {
+      return {
+        ok: false,
+        code: "unknown_atom_id",
+        error: `Bond ID ${ref.bondId} references missing endpoint atom ${endB}.`,
+      };
+    }
+    if (hasAtom1 && hasAtom2) {
+      const check1 = resolveAtom(mol, rawAtom1);
+      if (!check1.ok) return check1;
+      const check2 = resolveAtom(mol, rawAtom2);
+      if (!check2.ok) return check2;
+      const matchesEndpoints =
+        (endA === rawAtom1 && endB === rawAtom2) || (endA === rawAtom2 && endB === rawAtom1);
+      if (!matchesEndpoints) {
+        return {
+          ok: false,
+          code: "bond_endpoint_mismatch",
+          error: `Bond ID ${ref.bondId} connects atoms (${endA}, ${endB}), which does not match specified atoms (${rawAtom1}, ${rawAtom2}).`,
+        };
+      }
+    }
+    return {
+      ok: true,
+      bond: { id: bond.id, a: endA, b: endB, order: bond.order },
+      atomA: rA.atom,
+      atomB: rB.atom,
+    };
+  }
+
+  // Resolve by endpoint pair (rawAtom1, rawAtom2)
+  const r1 = resolveAtom(mol, rawAtom1);
+  if (!r1.ok) return r1;
+  const r2 = resolveAtom(mol, rawAtom2);
+  if (!r2.ok) return r2;
+
+  const matchingBonds = mol.bonds.filter((b) => {
+    const ba = b.a ?? b.a1;
+    const bb = b.b ?? b.a2;
+    return (ba === rawAtom1 && bb === rawAtom2) || (ba === rawAtom2 && bb === rawAtom1);
+  });
+
+  if (matchingBonds.length === 0) {
+    return {
+      ok: false,
+      code: "unknown_bond_id",
+      error: `No bond exists between atom ${rawAtom1} (${r1.atom.el}) and atom ${rawAtom2} (${r2.atom.el}).`,
+    };
+  }
+  if (matchingBonds.length > 1) {
+    return {
+      ok: false,
+      code: "duplicate_bond",
+      error: `Multiple duplicate bonds found between atom ${rawAtom1} and atom ${rawAtom2}.`,
+    };
+  }
+
+  const found = matchingBonds[0];
+  return {
+    ok: true,
+    bond: { id: found.id, a: found.a ?? found.a1, b: found.b ?? found.a2, order: found.order },
+    atomA: r1.atom,
+    atomB: r2.atom,
+  };
+}
+
+/**
+ * Validates a proposed molecular graph for structural integrity, valence constraints,
+ * and OpenChemLib chemical validity before committing to state.
+ */
+export function validateProposedGraph(mol) {
+  const errors = [];
+  if (!mol || typeof mol !== "object" || !Array.isArray(mol.atoms) || !Array.isArray(mol.bonds)) {
+    return {
+      valid: false,
+      code: "invalid_graph",
+      error: "Proposed molecular structure is not a valid graph object.",
+      errors: ["Proposed molecular structure is not a valid graph object."],
+      atomCount: 0,
+      bondCount: 0,
+    };
+  }
+
+  if (mol.atoms.length === 0) {
+    return {
+      valid: false,
+      code: "empty_structure",
+      error: "Proposed molecular structure contains 0 atoms.",
+      errors: ["Proposed molecular structure contains 0 atoms."],
+      atomCount: 0,
+      bondCount: 0,
+    };
+  }
+
+  const atomIds = new Set();
+  const normalizedAtoms = [];
+  for (const a of mol.atoms) {
+    const el = a?.el || a?.element;
+    if (!isValidEntityId(a?.id)) {
+      errors.push(`Invalid atom ID "${String(a?.id)}".`);
+      continue;
+    }
+    if (atomIds.has(a.id)) {
+      errors.push(`Duplicate atom ID ${a.id} in molecular graph.`);
+      continue;
+    }
+    if (!Number.isFinite(a.x) || !Number.isFinite(a.y)) {
+      errors.push(`Atom ${a.id} has non-finite coordinates.`);
+      continue;
+    }
+    if (typeof el !== "string" || !atomicNo(el)) {
+      errors.push(`Atom ${a.id} has unrecognized chemical element "${String(el)}".`);
+      continue;
+    }
+    atomIds.add(a.id);
+    normalizedAtoms.push({
+      id: a.id,
+      x: a.x,
+      y: a.y,
+      el,
+      charge: Number(a.charge) || 0,
+    });
+  }
+
+  if (errors.length > 0) {
+    return {
+      valid: false,
+      code: "invalid_atom",
+      error: errors.join(" "),
+      errors,
+      atomCount: mol.atoms.length,
+      bondCount: mol.bonds.length,
+    };
+  }
+
+  const bondIds = new Set();
+  const bondPairs = new Set();
+  const normalizedBonds = [];
+  let failureCode = null;
+
+  for (const b of mol.bonds) {
+    const ba = b?.a ?? b?.a1;
+    const bb = b?.b ?? b?.a2;
+    if (!isValidEntityId(b?.id)) {
+      errors.push(`Invalid bond ID "${String(b?.id)}".`);
+      failureCode = failureCode || "invalid_bond_id";
+      continue;
+    }
+    if (bondIds.has(b.id)) {
+      errors.push(`Duplicate bond ID ${b.id} in molecular graph.`);
+      failureCode = failureCode || "duplicate_bond";
+      continue;
+    }
+    if (!isValidEntityId(ba) || !isValidEntityId(bb)) {
+      errors.push(`Bond ${b.id} has invalid endpoint atom IDs (${String(ba)}, ${String(bb)}).`);
+      failureCode = failureCode || "invalid_atom_id";
+      continue;
+    }
+    if (ba === bb) {
+      errors.push(`Self-bond detected on atom ${ba} (bond ${b.id}).`);
+      failureCode = failureCode || "self_bond";
+      continue;
+    }
+    if (!atomIds.has(ba) || !atomIds.has(bb)) {
+      errors.push(`Bond ${b.id} references non-existent endpoint atom(s) (${ba}, ${bb}).`);
+      failureCode = failureCode || "unknown_atom_id";
+      continue;
+    }
+    if (!Number.isInteger(b.order) || ![1, 2, 3].includes(b.order)) {
+      errors.push(`Bond ${b.id} has invalid bond order "${String(b.order)}" (must be 1, 2, or 3).`);
+      failureCode = failureCode || "invalid_bond_order";
+      continue;
+    }
+    const pairKey = ba < bb ? `${ba}:${bb}` : `${bb}:${ba}`;
+    if (bondPairs.has(pairKey)) {
+      errors.push(`Duplicate bond detected between atom ${ba} and atom ${bb}.`);
+      failureCode = failureCode || "duplicate_bond";
+      continue;
+    }
+    bondIds.add(b.id);
+    bondPairs.add(pairKey);
+    normalizedBonds.push({ id: b.id, a: ba, b: bb, order: b.order });
+  }
+
+  if (errors.length > 0) {
+    return {
+      valid: false,
+      code: failureCode || "invalid_bond",
+      error: errors.join(" "),
+      errors,
+      atomCount: normalizedAtoms.length,
+      bondCount: mol.bonds.length,
+    };
+  }
+
+  const normalizedMol = { atoms: normalizedAtoms, bonds: normalizedBonds };
+
+  // Check chemical valence limits using the engine's valenceMap and isOvervalent helpers
+  const vMap = valenceMap(normalizedMol);
+  for (const atom of normalizedAtoms) {
+    const bondSum = vMap.get(atom.id) || 0;
+    if (isOvervalent(atom, bondSum)) {
+      const maxBase = MAX_VALENCE[atom.el];
+      const allowedMax = maxBase != null ? adjustForCharge(atom.el, maxBase, atom.charge || 0) : maxBase;
+      errors.push(
+        `Valence violation on atom ${atom.id} (${atom.el}): total bond order ${bondSum} exceeds maximum allowed valence${allowedMax != null ? ` of ${allowedMax}` : ""}.`
+      );
+    }
+  }
+
+  if (errors.length > 0) {
+    return {
+      valid: false,
+      code: "valence_violation",
+      error: errors.join(" "),
+      errors,
+      atomCount: normalizedAtoms.length,
+      bondCount: normalizedBonds.length,
+    };
+  }
+
+  // Validate conversion and round-trip parseability through OpenChemLib
+  try {
+    const exp = exportStructure(normalizedMol);
+    if (!exp.smiles || typeof exp.smiles !== "string") {
+      return {
+        valid: false,
+        code: "ocl_conversion_failed",
+        error: "OpenChemLib failed to generate a valid SMILES for the proposed structure.",
+        errors: ["OpenChemLib failed to generate a valid SMILES for the proposed structure."],
+        atomCount: normalizedAtoms.length,
+        bondCount: normalizedBonds.length,
+      };
+    }
+    // Verify OpenChemLib can parse the resulting SMILES without throwing
+    OCL.Molecule.fromSmiles(exp.smiles);
+
+    return {
+      valid: true,
+      errors: [],
+      smiles: exp.smiles,
+      molfile: exp.molfile,
+      formula: exp.formula,
+      weight: exp.weight,
+      atomCount: normalizedAtoms.length,
+      bondCount: normalizedBonds.length,
+    };
+  } catch (err) {
+    const msg = err?.message || "Invalid chemical structure rejected by OpenChemLib.";
+    return {
+      valid: false,
+      code: "ocl_validation_failed",
+      error: msg,
+      errors: [msg],
+      atomCount: normalizedAtoms.length,
+      bondCount: normalizedBonds.length,
+    };
+  }
+}
+
+/**
+ * Strictly validates and proposes adding a new bond between two existing atoms,
+ * rejecting self-bonds and duplicate bonds between already-connected atoms.
+ */
+export function proposeBondAddition(mol, { atomId1, atomId2, order = 1 } = {}) {
+  if (!Number.isInteger(order) || ![1, 2, 3].includes(order)) {
+    return {
+      ok: false,
+      code: "invalid_bond_order",
+      error: `Invalid bond order "${String(order)}": bond order must be 1, 2, or 3.`,
+    };
+  }
+  const r1 = resolveAtom(mol, atomId1);
+  if (!r1.ok) return r1;
+  const r2 = resolveAtom(mol, atomId2);
+  if (!r2.ok) return r2;
+
+  if (atomId1 === atomId2) {
+    return {
+      ok: false,
+      code: "self_bond",
+      error: `Self-bond attempt rejected: cannot bond atom ${atomId1} to itself.`,
+    };
+  }
+
+  const existing = findBond(mol, atomId1, atomId2);
+  if (existing) {
+    return {
+      ok: false,
+      code: "duplicate_bond",
+      error: `Duplicate bond attempt rejected: bond ${existing.id} already connects atom ${atomId1} (${r1.atom.el}) and atom ${atomId2} (${r2.atom.el}). Use change_bond_order instead.`,
+    };
+  }
+
+  const base = cloneMolecule(mol);
+  const newBondId = nextId();
+  const proposedMol = {
+    atoms: base.atoms,
+    bonds: [...base.bonds, { id: newBondId, a: atomId1, b: atomId2, order }],
+  };
+
+  const validation = validateProposedGraph(proposedMol);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      code: validation.code || "validation_failed",
+      validationFailed: true,
+      validationErrors: validation.errors,
+      error: validation.error,
+    };
+  }
+
+  return {
+    ok: true,
+    proposedMol,
+    bondId: newBondId,
+    validation,
+  };
+}
+
+/**
+ * Pure, non-destructive transactional proposal for changing an existing bond's order.
+ * Resolves identities, checks for duplicate/no-op bond order or invalid valence,
+ * and returns the validated candidate graph without modifying the input molecule.
+ */
+export function proposeBondOrderChange(mol, params = {}) {
+  const { bondId, atomId1, atomId2, a, b, a1, a2, order, createBond } = params || {};
+
+  if (!Number.isInteger(order) || ![1, 2, 3].includes(order)) {
+    return {
+      ok: false,
+      code: "invalid_bond_order",
+      error: `Invalid bond order "${String(order)}": bond order must be 1 (single), 2 (double), or 3 (triple).`,
+    };
+  }
+
+  const resolved = resolveBond(mol, { bondId, atomId1, atomId2, a, b, a1, a2 });
+  if (!resolved.ok) {
+    return resolved;
+  }
+
+  const { bond, atomA, atomB } = resolved;
+
+  if (createBond === true) {
+    return {
+      ok: false,
+      code: "duplicate_bond",
+      error: `Duplicate bond attempt rejected: bond ${bond.id} already exists between atom ${atomA.id} (${atomA.el}) and atom ${atomB.id} (${atomB.el}).`,
+    };
+  }
+
+  if (bond.order === order) {
+    return {
+      ok: false,
+      code: "duplicate_bond",
+      error: `Duplicate bond order attempt rejected: bond ${bond.id} between atom ${atomA.id} (${atomA.el}) and atom ${atomB.id} (${atomB.el}) already has order ${order}.`,
+    };
+  }
+
+  // Apply non-destructive modification on a cloned graph using the engine's setBondOrder
+  const baseMol = cloneMolecule(mol);
+  const proposedMol = setBondOrder(baseMol, bond.id, order);
+
+  const validation = validateProposedGraph(proposedMol);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      code: validation.code || "validation_failed",
+      validationFailed: true,
+      validationErrors: validation.errors,
+      error: validation.error,
+    };
+  }
+
+  const orderLabels = { 1: "single", 2: "double", 3: "triple" };
+  const summary = `Changed bond ${bond.id} between ${atomA.el}${atomA.id} and ${atomB.el}${atomB.id} from ${orderLabels[bond.order] || bond.order} (order ${bond.order}) to ${orderLabels[order]} (order ${order}).`;
+
+  return {
+    ok: true,
+    proposedMol,
+    validation,
+    summary,
+    mutatedBond: {
+      id: bond.id,
+      a: atomA.id,
+      b: atomB.id,
+      a1: atomA.id,
+      a2: atomB.id,
+      previousOrder: bond.order,
+      order,
+    },
+  };
+}
+
+
 

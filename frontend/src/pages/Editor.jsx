@@ -110,6 +110,7 @@ export default function MolecularEditor() {
   const desktopEditorRef = useRef(null);
   const mobileEditorRef = useRef(null);
   const bridgeRef = useRef(null);
+  const actionLedgerRef = useRef(new Map());
   const [pendingBridgeReplacement, setPendingBridgeReplacement] = useState(null);
 
   // Phase 2B: Interactive ChemAI Assistant Drawer (Live Editor Handshake)
@@ -176,6 +177,8 @@ export default function MolecularEditor() {
               load_structure_into_editor: "Loading structure onto canvas...",
               fit_canvas_view: "Centering canvas view...",
               get_editor_capabilities: "Checking editor capabilities...",
+              change_bond_order: "Modifying bond order on canvas...",
+              mutate_editor_structure: "Applying molecular modification...",
             };
             setChatAgentStatus(toolLabels[s.action?.tool] || `Executing: ${s.action?.tool}...`);
           } else {
@@ -420,7 +423,27 @@ export default function MolecularEditor() {
   useEffect(() => {
     const target = {
       getMolecule: () => moleculeManager.molRef.current,
+      getRevision: () => moleculeManager.revisionRef.current,
       exportCurrent: () => moleculeManager.exportCurrent(),
+      commitMolecule: (newMol) => {
+        moleculeManager.pushState(newMol);
+        setIdentifyResult(null);
+        setIdentifyError(null);
+        setExplainResult(null);
+        setExplainError(null);
+      },
+      setMolecule: (newMol) => {
+        moleculeManager.pushState(newMol);
+        setIdentifyResult(null);
+        setIdentifyError(null);
+        setExplainResult(null);
+        setExplainError(null);
+      },
+      undo: () => moleculeManager.undo(),
+      redo: () => moleculeManager.redo(),
+      canUndo: () => moleculeManager.historyRef.current.past.length > 0,
+      canRedo: () => moleculeManager.historyRef.current.future.length > 0,
+      getHistory: () => moleculeManager.historyRef.current,
       loadSmiles: (smiles) => {
         moleculeManager.loadSmiles(smiles);
         setIdentifyResult(null);
@@ -464,7 +487,7 @@ export default function MolecularEditor() {
       },
     };
 
-    const bridge = createEditorBridge(target);
+    const bridge = createEditorBridge(target, { actionLedger: actionLedgerRef.current });
     bridgeRef.current = bridge;
     const unregister = registerEditorBridge(bridge);
 
@@ -474,7 +497,13 @@ export default function MolecularEditor() {
         load_structure_into_editor: bridge.load_structure_into_editor,
         fit_canvas_view: bridge.fit_canvas_view,
         get_editor_capabilities: bridge.get_editor_capabilities,
+        change_bond_order: bridge.change_bond_order,
+        mutate_editor_structure: bridge.mutate_editor_structure,
+        executeMutation: bridge.executeMutation,
         executeAction: bridge.executeAction,
+        getRevision: bridge.getRevision,
+        undo: bridge.undo,
+        redo: bridge.redo,
       };
     }
 

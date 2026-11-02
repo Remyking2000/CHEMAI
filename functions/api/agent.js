@@ -263,9 +263,49 @@ export function validateArgs(schema, args) {
         errors.push(`"${key}" contains unsupported characters.`);
       }
       value[key] = t;
+    } else if (spec.type === "integer") {
+      if (typeof v !== "number" || !Number.isInteger(v)) {
+        errors.push(`"${key}" must be an integer.`);
+        continue;
+      }
+      if (spec.minimum !== undefined && v < spec.minimum) {
+        errors.push(`"${key}" must be at least ${spec.minimum}.`);
+      }
+      if (spec.maximum !== undefined && v > spec.maximum) {
+        errors.push(`"${key}" must be at most ${spec.maximum}.`);
+      }
+      if (spec.enum && !spec.enum.includes(v)) {
+        errors.push(`"${key}" must be one of: ${spec.enum.join(", ")}.`);
+      }
+      value[key] = v;
+    } else if (spec.type === "number") {
+      if (typeof v !== "number" || !Number.isFinite(v)) {
+        errors.push(`"${key}" must be a finite number.`);
+        continue;
+      }
+      if (spec.minimum !== undefined && v < spec.minimum) {
+        errors.push(`"${key}" must be at least ${spec.minimum}.`);
+      }
+      if (spec.maximum !== undefined && v > spec.maximum) {
+        errors.push(`"${key}" must be at most ${spec.maximum}.`);
+      }
+      if (spec.enum && !spec.enum.includes(v)) {
+        errors.push(`"${key}" must be one of: ${spec.enum.join(", ")}.`);
+      }
+      value[key] = v;
+    } else if (spec.type === "boolean") {
+      if (typeof v !== "boolean") {
+        errors.push(`"${key}" must be a boolean.`);
+        continue;
+      }
+      value[key] = v;
     } else {
       errors.push(`Unsupported schema type for "${key}".`);
     }
+  }
+  if (!errors.length && typeof schema.validate === "function") {
+    const customErr = schema.validate(value);
+    if (customErr) errors.push(customErr);
   }
   return errors.length ? { ok: false, error: errors.join(" ") } : { ok: true, value };
 }
@@ -586,6 +626,74 @@ export function createToolRegistry(handlers) {
         additionalProperties: false,
       },
     },
+    {
+      name: "change_bond_order",
+      runtime: "client",
+      provenance: "client_editor_bridge",
+      description:
+        "Change the bond order (1 = single, 2 = double, 3 = triple) of an existing bond in the user's active molecular editor canvas using stable bond or atom IDs obtained from read_editor_structure. Never guess IDs or use screen coordinates; call read_editor_structure first to inspect the current molecular graph and revision.",
+      parameters: {
+        type: "object",
+        properties: {
+          bondId: {
+            type: "integer",
+            minimum: 1,
+            description: "Stable ID of the existing bond to modify (from read_editor_structure graph.bonds).",
+          },
+          atomId1: {
+            type: "integer",
+            minimum: 1,
+            description: "First endpoint atom ID of the bond (from read_editor_structure graph.atoms).",
+          },
+          atomId2: {
+            type: "integer",
+            minimum: 1,
+            description: "Second endpoint atom ID of the bond (from read_editor_structure graph.atoms).",
+          },
+          order: {
+            type: "integer",
+            enum: [1, 2, 3],
+            description: "Target bond order: 1 (single), 2 (double), or 3 (triple).",
+          },
+          expectedRevision: {
+            type: "integer",
+            minimum: 1,
+            description: "Optional molecular structure revision number from read_editor_structure to prevent modifying a stale structure.",
+          },
+          requireApproval: {
+            type: "boolean",
+            description: "Optional flag to require explicit user confirmation before committing.",
+          },
+          approved: {
+            type: "boolean",
+            description: "Optional pre-approval flag.",
+          },
+          actionId: {
+            type: "string",
+            minLength: 1,
+            maxLength: 120,
+            description: "Optional idempotency action identifier.",
+          },
+        },
+        required: ["order"],
+        additionalProperties: false,
+        validate(val) {
+          const hasBondId = val.bondId !== undefined;
+          const hasAtom1 = val.atomId1 !== undefined;
+          const hasAtom2 = val.atomId2 !== undefined;
+          if ((hasAtom1 && !hasAtom2) || (!hasAtom1 && hasAtom2)) {
+            return "Both \"atomId1\" and \"atomId2\" must be provided when referencing a bond by its endpoint atoms.";
+          }
+          if (!hasBondId && !hasAtom1 && !hasAtom2) {
+            return "change_bond_order requires either \"bondId\" or both \"atomId1\" and \"atomId2\".";
+          }
+          if (hasAtom1 && hasAtom2 && val.atomId1 === val.atomId2) {
+            return "Self-bond attempt rejected: \"atomId1\" and \"atomId2\" must be distinct atom IDs.";
+          }
+          return null;
+        },
+      },
+    },
   ];
 
   return new Map(tools.map((t) => [t.name, t]));
@@ -630,8 +738,9 @@ TOOL USE POLICY (you decide):
 - Answer directly, without tools, whenever you can do so reliably from chemistry knowledge (concepts, mechanisms, trends, general explanations).
 - Call a tool only when it supplies evidence or performs actions you actually need:
   * Server tools: generate_structure, identify_structure, lookup_structure, analyze_compound, explain_structure.
-  * Client editor tools: read_editor_structure, load_structure_into_editor, fit_canvas_view, get_editor_capabilities.
-- To inspect or answer questions about what the user has drawn on the canvas, call read_editor_structure. Inspect its result (smiles, atomCount, isEmpty). If the user asks for identity or explanation, take the returned SMILES and call identify_structure or explain_structure.
+  * Client editor tools: read_editor_structure, load_structure_into_editor, fit_canvas_view, get_editor_capabilities, change_bond_order.
+- To inspect or answer questions about what the user has drawn on the canvas, call read_editor_structure. Inspect its result (smiles, atomCount, isEmpty, revision, graph). If the user asks for identity or explanation, take the returned SMILES and call identify_structure or explain_structure.
+- To modify the bond order of an existing bond on the canvas, first call read_editor_structure to obtain the current graph (atom IDs, bond IDs, and revision), then call change_bond_order with the target bondId (or atomId1 and atomId2), the new order (1, 2, or 3), and expectedRevision. Never guess atom or bond IDs.
 - To draw or load a molecule into the user's editor, first obtain or verify its SMILES (using lookup_structure or generate_structure if needed), then call load_structure_into_editor with the SMILES.
 - To center, frame, or fit the canvas view, call fit_canvas_view.
 - Gather only what the user's goal requires. Inspect each tool result before deciding the next step. You may call several tools in sequence (at most ${AGENT_LIMITS.MAX_TOOL_ITERATIONS} tool rounds).
@@ -690,6 +799,12 @@ function serializeToolResult(step) {
     provenance: step.result.provenance,
     ...(step.result.ok ? { data: step.result.data } : { error: step.result.error }),
     ...(step.result.errorType ? { errorType: step.result.errorType } : {}),
+    ...(step.result.failureCode ? { failureCode: step.result.failureCode } : {}),
+    ...(step.result.revision !== undefined ? { revision: step.result.revision } : {}),
+    ...(step.result.summary ? { summary: step.result.summary } : {}),
+    ...(Array.isArray(step.result.validationErrors) && step.result.validationErrors.length
+      ? { validationErrors: step.result.validationErrors }
+      : {}),
     ...(step.result.note ? { note: step.result.note } : {}),
   };
   return truncate(JSON.stringify(payload), AGENT_LIMITS.MAX_TOOL_RESULT_CHARS);
@@ -703,6 +818,24 @@ export function parseStructuredAction(text) {
   if (typeof text !== "string") return { type: "final", text: "" };
   const trimmed = text.trim();
   const cleaned = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+
+  // Check for an explicit {"action":"call_tool",...} JSON block even if preceded by brief text
+  const actionMatch = cleaned.match(/\{\s*"action"\s*:\s*"call_tool"[\s\S]*\}/);
+  if (actionMatch) {
+    try {
+      const obj = JSON.parse(actionMatch[0]);
+      if (obj && obj.action === "call_tool" && typeof obj.tool === "string") {
+        return {
+          type: "tool_calls",
+          calls: [{ name: obj.tool, arguments: obj.arguments ?? {} }],
+          content: "",
+        };
+      }
+    } catch {
+      // Fall through to standard JSON parsing
+    }
+  }
+
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
   // Only treat as an action if the reply is essentially a single JSON object.
@@ -898,6 +1031,18 @@ async function nativeNext({ env, fetchImpl, registry, systemPrompt, history, mes
         };
       }
       if (typeof msg.content === "string" && msg.content.trim()) {
+        if (!forceFinal) {
+          const fallbackParsed = parseStructuredAction(msg.content);
+          if (fallbackParsed.type === "tool_calls") {
+            return {
+              type: "tool_calls",
+              provider: "openrouter",
+              model,
+              content: "",
+              calls: fallbackParsed.calls,
+            };
+          }
+        }
         return { type: "final", text: msg.content.trim(), provider: "openrouter", model };
       }
       failures?.push({
@@ -1036,6 +1181,15 @@ function describeClientStep(step) {
     if (step.name === "get_editor_capabilities") {
       return `- **get_editor_capabilities**: editor mode \`${d.viewMode || "unknown"}\`, ready: ${Boolean(d.isReady)}.`;
     }
+    if (step.name === "change_bond_order" || step.name === "mutate_editor_structure") {
+      const parts = [
+        d.summary || r.summary,
+        d.smiles && `resulting SMILES \`${d.smiles}\``,
+        d.formula && `formula ${d.formula}`,
+        typeof (d.revision ?? r.revision) === "number" && `revision ${d.revision ?? r.revision}`,
+      ].filter(Boolean);
+      return `- **${step.name}**: modified structure in the molecular editor (${parts.join(", ") || "confirmed"}).`;
+    }
   }
   const errType = r.errorType;
   if (errType === AGENT_ERROR_TYPES.EDITOR_UNAVAILABLE || r.unavailable) {
@@ -1145,6 +1299,12 @@ export async function runAgent({
         "Client action result does not match the pending tool call."
       );
     }
+    if (steps.some((s) => s.id && pending.id && s.id === pending.id)) {
+      throw new AgentError(
+        AGENT_ERROR_TYPES.INVALID_CONTINUATION,
+        "Duplicate continuation submission: this action ID has already been processed."
+      );
+    }
     const resPayload = clientActionResult.result || {};
     const isOk = Boolean(resPayload.ok);
     const errorType = isOk ? undefined : classifyClientFailure(resPayload);
@@ -1154,6 +1314,16 @@ export async function runAgent({
       provenance: "client_editor_bridge",
       ...(isOk ? { data: resPayload.data || {} } : { error: errorMsg }),
       ...(errorType ? { errorType } : {}),
+      ...(resPayload.actionId !== undefined ? { actionId: resPayload.actionId } : {}),
+      ...(resPayload.operation !== undefined ? { operation: resPayload.operation } : {}),
+      ...(resPayload.status !== undefined ? { status: resPayload.status } : {}),
+      ...(resPayload.revision !== undefined ? { revision: resPayload.revision } : {}),
+      ...(resPayload.summary !== undefined ? { summary: resPayload.summary } : {}),
+      ...(resPayload.validationErrors !== undefined ? { validationErrors: resPayload.validationErrors } : {}),
+      ...(resPayload.failureCode !== undefined ? { failureCode: resPayload.failureCode } : {}),
+      ...(resPayload.rejected ? { rejected: true } : {}),
+      ...(resPayload.validationFailed ? { validationFailed: true } : {}),
+      ...(resPayload.interrupted ? { interrupted: true } : {}),
       ...(resPayload.cancelled ? { cancelled: true } : {}),
       ...(resPayload.unavailable ? { unavailable: true } : {}),
       ...(resPayload.needsApproval ? { needsApproval: true } : {}),

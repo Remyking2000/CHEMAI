@@ -324,6 +324,14 @@ export default function MobileMolecularEditor({
       getViewport: () => ({ zoom, pan }),
       getDimensions: () => ({ ...dimensions }),
       getMolecule: () => molRef.current,
+      setMolecule: (nextMol) => pushState(nextMol),
+      commitMolecule: (nextMol) => pushState(nextMol),
+      undo: handleUndo,
+      redo: handleRedo,
+      canUndo: () => history.past.length > 0,
+      canRedo: () => history.future.length > 0,
+      getViewMode: () => "mobile",
+      isReady: () => true,
     };
     if (typeof editorRef === "function") {
       editorRef(api);
@@ -334,7 +342,7 @@ export default function MobileMolecularEditor({
       if (typeof editorRef === "function") editorRef(null);
       else if (editorRef && typeof editorRef === "object") editorRef.current = null;
     };
-  }, [editorRef, handleFitToScreen, zoom, pan, dimensions]);
+  }, [editorRef, handleFitToScreen, pushState, handleUndo, handleRedo, history.past.length, history.future.length, zoom, pan, dimensions]);
 
   const handleZoomChange = (factor) => {
     setZoom((z) => Math.min(2.5, Math.max(0.45, z * factor)));

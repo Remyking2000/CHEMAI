@@ -121,11 +121,12 @@ console.log("--- Starting ChemAI Agent Core Tests ---");
   assert(res.agent.mode === "native" && res.agent.stopReason === "final_answer", "General question: native mode, final_answer stop reason");
   assert(
     Array.isArray(requests[0].tools) &&
-      requests[0].tools.length === 9 &&
+      requests[0].tools.length === 10 &&
       requests[0].tools.some((t) => t.function?.name === "read_editor_structure") &&
+      requests[0].tools.some((t) => t.function?.name === "change_bond_order") &&
       requests[0].tools.some((t) => t.function?.name === "generate_structure") &&
       requests[0].tool_choice === "auto",
-    "Model is offered the 9 allowlisted tools (5 server + 4 client) with tool_choice=auto"
+    "Model is offered the 10 allowlisted tools (5 server + 5 client) with tool_choice=auto"
   );
 }
 
@@ -299,6 +300,12 @@ console.log("--- Starting ChemAI Agent Core Tests ---");
 {
   assert(parseStructuredAction("Plain markdown answer {not json}").type === "final", "Plain text is treated as a final answer");
   assert(parseStructuredAction('{"action":"call_tool","tool":"identify_structure","arguments":{"smiles":"CCO"}}').calls[0].name === "identify_structure", "JSON action is parsed into a tool call");
+  assert(
+    parseStructuredAction(
+      'To identify the molecule on your canvas, I will read the structure first. {"action":"call_tool","tool":"read_editor_structure","arguments":{}}'
+    ).calls?.[0]?.name === "read_editor_structure",
+    "JSON action preceded by conversational preamble is parsed into a tool call"
+  );
   assert(checkSmilesSyntax("CC(=O)OC1=CC=CC=C1C(=O)O").plausible === true, "SMILES syntax check accepts aspirin");
   assert(checkSmilesSyntax("C1CC(C").plausible === false, "SMILES syntax check flags unbalanced/unpaired SMILES");
   assert(!buildAgentSystemPrompt(null, createToolRegistry(mockHandlers().handlers), "native").includes("ATTACHED VERIFIED"), "No compound block when no compound is attached");

@@ -236,6 +236,14 @@ export default function DesktopMolecularEditor({
       getViewport: () => ({ zoom: zoomRef.current, pan: panRef.current }),
       getDimensions: () => ({ ...dimensionsRef.current }),
       getMolecule: () => currentMolRef.current,
+      setMolecule: (nextMol) => pushState(nextMol, true),
+      commitMolecule: (nextMol) => pushState(nextMol, true),
+      undo: handleUndo,
+      redo: handleRedo,
+      canUndo: () => canUndo,
+      canRedo: () => canRedo,
+      getViewMode: () => "desktop",
+      isReady: () => true,
     };
     if (typeof editorRef === "function") {
       editorRef(api);
@@ -246,7 +254,7 @@ export default function DesktopMolecularEditor({
       if (typeof editorRef === "function") editorRef(null);
       else if (editorRef && typeof editorRef === "object") editorRef.current = null;
     };
-  }, [editorRef, fitMoleculeToViewport]);
+  }, [editorRef, fitMoleculeToViewport, pushState, handleUndo, handleRedo, canUndo, canRedo]);
 
   const isMoleculeClipped = useCallback((mol, dims, curZoom, curPan) => {
     if (!mol || !mol.atoms || mol.atoms.length === 0) return false;

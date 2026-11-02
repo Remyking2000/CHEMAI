@@ -37,14 +37,19 @@ import {
   getActiveEditorBridge,
   ALLOWED_BRIDGE_ACTIONS,
   BRIDGE_ERROR_TYPES,
+  MUTATION_FAILURE_CODES,
 } from "./frontend/src/lib/editorBridge.js";
 import { executeClientTool, sendAgentChat } from "./frontend/src/lib/agentHandshake.js";
+import { createMoleculeStateManager } from "./frontend/src/lib/moleculeEngine.js";
+
+let passed = 0;
 
 function assert(condition, message) {
   if (!condition) {
     console.error(`FAIL: ${message}`);
     process.exit(1);
   }
+  passed++;
   console.log(`PASS: ${message}`);
 }
 
@@ -208,7 +213,7 @@ console.log("--- Starting ChemAI Agent Molecular Editor Handshake Tests (Phase 2
   const { handlers } = mockHandlers();
   const registry = createToolRegistry(handlers);
 
-  assert(registry.size === 9, "Tool registry contains exactly 9 tools (5 server + 4 client)");
+  assert(registry.size === 10, "Tool registry contains exactly 10 tools (5 server + 5 client)");
 
   // Server tools
   const serverToolNames = ["generate_structure", "identify_structure", "lookup_structure", "analyze_compound", "explain_structure"];
@@ -219,7 +224,7 @@ console.log("--- Starting ChemAI Agent Molecular Editor Handshake Tests (Phase 2
   }
 
   // Client tools
-  const clientToolNames = ["read_editor_structure", "load_structure_into_editor", "fit_canvas_view", "get_editor_capabilities"];
+  const clientToolNames = ["read_editor_structure", "load_structure_into_editor", "fit_canvas_view", "get_editor_capabilities", "change_bond_order"];
   for (const name of clientToolNames) {
     const t = registry.get(name);
     assert(t && t.runtime === "client", `Client tool "${name}" has runtime === 'client'`);
@@ -1471,4 +1476,333 @@ console.log("--- Starting ChemAI Agent Molecular Editor Handshake Tests (Phase 2
   assert(res.reply.includes("declined"), "Agent communicates truthful outcome without duplicating mutation");
 }
 
+/* 28. Phase 3A: End-to-End Agent Mutation Handshake (read_editor_structure -> change_bond_order -> Verified Final Answer) */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+  const stateManager = createMoleculeStateManager(null, "C=C"); // Ethene on canvas
+  const bridge = createEditorBridge({
+    ...stateManager,
+    getViewMode: () => "desktop",
+    isReady: () => true,
+  });
+  const unregister = registerEditorBridge(bridge);
+
+  try {
+    // Turn 1: Agent requests read_editor_structure to inspect stable IDs & revision
+    const { fetchImpl: f1 } = mockOpenRouter([
+      toolCall("call_read_ethene", "read_editor_structure", {}),
+    ]);
+    const step1 = await runAgent({
+      message: "Change the double bond between the two carbon atoms into a single bond.",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+      fetchImpl: f1,
+    });
+    assert(step1.status === "action_required" && step1.actionRequest.tool === "read_editor_structure", "Step 1 suspends for read_editor_structure");
+
+    // Client executes read_editor_structure
+    const readResult = await executeClientTool(step1.actionRequest.tool, step1.actionRequest.arguments, step1.actionRequest.id);
+    assert(readResult.ok === true && readResult.data.revision === 1, "Client read returns revision 1 and graph");
+    const targetBond = readResult.data.graph.bonds[0];
+    assert(targetBond.order === 2, "Read confirms existing double bond (order 2)");
+
+    // Turn 2: Agent uses actual bondId and expectedRevision from read_editor_structure to request change_bond_order
+    const { fetchImpl: f2 } = mockOpenRouter([
+      toolCall("call_mutate_bond", "change_bond_order", {
+        bondId: targetBond.id,
+        order: 1,
+        expectedRevision: readResult.data.revision,
+      }),
+    ]);
+    const step2 = await runAgent({
+      continuationToken: step1.continuationToken,
+      clientActionResult: {
+        id: step1.actionRequest.id,
+        tool: step1.actionRequest.tool,
+        result: readResult,
+      },
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+      fetchImpl: f2,
+    });
+    assert(step2.status === "action_required" && step2.actionRequest.tool === "change_bond_order", "Step 2 suspends for change_bond_order before claiming success");
+    assert(step2.actionRequest.arguments.bondId === targetBond.id && step2.actionRequest.arguments.order === 1, "Action request carries validated bondId and order");
+    assert(stateManager.exportCurrent().smiles === "C=C", "Canvas is not modified before client executes the action");
+
+    // Client executes change_bond_order through the active bridge
+    const mutateResult = await executeClientTool(step2.actionRequest.tool, step2.actionRequest.arguments, step2.actionRequest.id);
+    assert(mutateResult.ok === true && mutateResult.status === "committed", "Client bridge commits the bond-order mutation");
+    assert(mutateResult.revision === 2 && mutateResult.data.smiles === "CC" && mutateResult.data.formula === "C2H6", "Committed structure is verified as Ethane (CC, C2H6) at revision 2");
+
+    // Turn 3: Agent receives the verified mutation result and formulates its final response
+    const { fetchImpl: f3, requests: r3 } = mockOpenRouter([
+      { content: "I have changed the carbon-carbon double bond to a single bond, converting ethene (C2H4) into ethane (CC, C2H6)." },
+    ]);
+    const finalRes = await runAgent({
+      continuationToken: step2.continuationToken,
+      clientActionResult: {
+        id: step2.actionRequest.id,
+        tool: step2.actionRequest.tool,
+        result: mutateResult,
+      },
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+      fetchImpl: f3,
+    });
+
+    assert(finalRes.reply.includes("ethane") && finalRes.reply.includes("single bond"), "Agent delivers final answer after editor confirms commit");
+    assert(finalRes.agent.toolCalls.length === 2 && finalRes.agent.toolCalls[1].name === "change_bond_order" && finalRes.agent.toolCalls[1].ok === true, "Agent trace records both read_editor_structure and change_bond_order as ok: true");
+    const serializedMutMsg = r3[0].messages.find((m) => m.role === "tool" && m.tool_call_id === "call_mutate_bond");
+    assert(serializedMutMsg && JSON.parse(serializedMutMsg.content).revision === 2, "Tool message passed to LLM includes verified revision 2");
+  } finally {
+    unregister();
+  }
+}
+
+/* 29. Phase 3A: Backend Tool Argument Validation for change_bond_order */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // 29a. Missing bond selector (neither bondId nor atomId1/atomId2)
+  const { fetchImpl: fMissingTarget } = mockOpenRouter([
+    toolCall("c_no_target", "change_bond_order", { order: 2 }),
+    { content: "I need to read the structure first to identify the target bond." },
+  ]);
+  const resNoTarget = await runAgent({
+    message: "Make it a double bond",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: fMissingTarget,
+  });
+  assert(resNoTarget.status !== "action_required", "change_bond_order without bondId or atomId1/atomId2 does not suspend");
+  assert(resNoTarget.agent.toolCalls[0].rejected === true, "Missing bond target is rejected by backend schema validation");
+
+  // 29b. Self-bond attempt (atomId1 === atomId2)
+  const { fetchImpl: fSelfBond } = mockOpenRouter([
+    toolCall("c_self_bond", "change_bond_order", { atomId1: 3, atomId2: 3, order: 2 }),
+    { content: "An atom cannot be bonded to itself." },
+  ]);
+  const resSelfBond = await runAgent({
+    message: "Bond atom 3 to atom 3",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: fSelfBond,
+  });
+  assert(resSelfBond.status !== "action_required", "Self-bond tool call does not suspend for client execution");
+  assert(resSelfBond.agent.toolCalls[0].rejected === true && /Self-bond/i.test(resSelfBond.agent.toolCalls[0].error), "Self-bond is rejected at backend validation layer");
+
+  // 29c. Invalid bond order (order: 4)
+  const { fetchImpl: fBadOrder } = mockOpenRouter([
+    toolCall("c_bad_order", "change_bond_order", { bondId: 1, order: 4 }),
+    { content: "Bond order must be 1, 2, or 3." },
+  ]);
+  const resBadOrder = await runAgent({
+    message: "Make a quadruple bond",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: fBadOrder,
+  });
+  assert(resBadOrder.status !== "action_required" && resBadOrder.agent.toolCalls[0].rejected === true, "Bond order 4 is rejected at backend validation layer");
+}
+
+/* 30. Phase 3A: Failed Mutation in Handshake (Valence Violation & Stale Revision) Preserves Structure & Reports Truthfully */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+  const stateManager = createMoleculeStateManager(null, "CCO"); // Ethanol
+  const bridge = createEditorBridge({
+    ...stateManager,
+    getViewMode: () => "desktop",
+    isReady: () => true,
+  });
+  const unregister = registerEditorBridge(bridge);
+
+  try {
+    const readRes = await bridge.read_editor_structure();
+    const oxygenAtom = readRes.data.graph.atoms.find((a) => a.element === "O");
+    const coBond = readRes.data.graph.bonds.find((b) => b.a1 === oxygenAtom.id || b.a2 === oxygenAtom.id);
+
+    // Agent requests changing C-O bond to a triple bond (impossible valence on neutral O)
+    const { fetchImpl: f1 } = mockOpenRouter([
+      toolCall("c_val_fail", "change_bond_order", { bondId: coBond.id, order: 3 }),
+    ]);
+    const suspended = await runAgent({
+      message: "Change the C-O bond to a triple bond",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+      fetchImpl: f1,
+    });
+
+    const clientMutRes = await executeClientTool(suspended.actionRequest.tool, suspended.actionRequest.arguments, suspended.actionRequest.id);
+    assert(clientMutRes.ok === false && clientMutRes.validationFailed === true, "Client bridge rejects impossible C#O valence");
+    assert(stateManager.exportCurrent().smiles === "CCO", "Ethanol structure is preserved unchanged after valence failure");
+
+    // Even if AI provider fails on continuation, deterministic fallback reports invalid_structure truthfully
+    const failingFetch = async () => new Response("Outage", { status: 503 });
+    const fallbackCallAI = async () => ({
+      text: "Fallback",
+      provider: "chemai-assistant",
+      model: "test/model",
+    });
+
+    const completed = await runAgent({
+      continuationToken: suspended.continuationToken,
+      clientActionResult: {
+        id: suspended.actionRequest.id,
+        tool: suspended.actionRequest.tool,
+        result: clientMutRes,
+      },
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: fallbackCallAI,
+      fetchImpl: failingFetch,
+    });
+
+    assert(completed.agent.toolCalls[0].ok === false && completed.agent.toolCalls[0].errorType === AGENT_ERROR_TYPES.INVALID_STRUCTURE, "Trace records invalid_structure for valence failure");
+    assert(/Valence violation/i.test(completed.reply) && /not changed/i.test(completed.reply), "Fallback reply truthfully reports valence violation and confirms drawing was not changed");
+  } finally {
+    unregister();
+  }
+}
+
+/* 31. Phase 3A: Continuation Replay Protection for Already-Processed Action ID */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  const replayedToken = createContinuationToken({
+    sessionId: "sess_replay",
+    message: "Change bond order",
+    steps: [
+      {
+        turn: 1,
+        id: "act_already_done",
+        name: "change_bond_order",
+        parsedArguments: { bondId: 1, order: 2 },
+        result: { ok: true, data: { smiles: "C=C", revision: 2 } },
+      },
+    ],
+    pendingCall: {
+      id: "act_already_done",
+      name: "change_bond_order",
+      parsedArguments: { bondId: 1, order: 2 },
+    },
+  });
+
+  let replayCaught = null;
+  try {
+    await runAgent({
+      continuationToken: replayedToken,
+      clientActionResult: {
+        id: "act_already_done",
+        tool: "change_bond_order",
+        result: { ok: true, data: { smiles: "C=C", revision: 2 } },
+      },
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+    });
+  } catch (err) {
+    replayCaught = err;
+  }
+
+  assert(replayCaught instanceof AgentError, "Replaying a continuation token with an already-processed action ID throws AgentError");
+  assert(replayCaught.type === AGENT_ERROR_TYPES.INVALID_CONTINUATION && replayCaught.status === 400, "Replayed continuation action ID surfaces invalid_continuation (400)");
+}
+
+/* 32. Phase 3A: Full sendAgentChat Coordinator with change_bond_order Across Desktop & Mobile + Undo/Redo */
+{
+  for (const mode of ["desktop", "mobile"]) {
+    const stateManager = createMoleculeStateManager(null, "CC=O"); // Acetaldehyde
+    const bridge = createEditorBridge({
+      ...stateManager,
+      getViewMode: () => mode,
+      isReady: () => true,
+    });
+    const unregister = registerEditorBridge(bridge);
+
+    try {
+      let turn = 0;
+      let readGraphFromClient = null;
+      const mockEndpoint = async (url, options) => {
+        const body = JSON.parse(options.body);
+        turn++;
+        if (turn === 1) {
+          return new Response(
+            JSON.stringify({
+              status: "action_required",
+              actionRequest: {
+                id: `read_${mode}_1`,
+                tool: "read_editor_structure",
+                arguments: {},
+              },
+              continuationToken: createContinuationToken({ turn: 1 }),
+            }),
+            { status: 200 }
+          );
+        }
+        if (turn === 2) {
+          readGraphFromClient = body.clientActionResult?.result?.data;
+          const doubleBond = readGraphFromClient.graph.bonds.find((b) => b.order === 2);
+          return new Response(
+            JSON.stringify({
+              status: "action_required",
+              actionRequest: {
+                id: `mut_${mode}_2`,
+                tool: "change_bond_order",
+                arguments: {
+                  bondId: doubleBond.id,
+                  order: 1,
+                  expectedRevision: readGraphFromClient.revision,
+                },
+              },
+              continuationToken: createContinuationToken({ turn: 2 }),
+            }),
+            { status: 200 }
+          );
+        }
+        const mutRes = body.clientActionResult?.result;
+        assert(mutRes?.ok === true && mutRes?.data?.viewMode === mode, `sendAgentChat (${mode}) mutation succeeded`);
+        return new Response(
+          JSON.stringify({
+            reply: `Reduced carbonyl double bond to a single bond in ${mode} mode, producing ethanol (${mutRes.data.smiles}, rev ${mutRes.revision}).`,
+            provider: "test-provider",
+            model: "test-model",
+          }),
+          { status: 200 }
+        );
+      };
+
+      const chatRes = await sendAgentChat({
+        message: "Change the C=O double bond to a single bond",
+        fetchImpl: mockEndpoint,
+      });
+
+      assert(chatRes.reply.includes("CCO") && chatRes.reply.includes("rev 2"), `sendAgentChat (${mode}) reports verified SMILES CCO and revision 2`);
+      assert(stateManager.exportCurrent().smiles === "CCO", `Canvas in ${mode} mode now holds Ethanol (CCO)`);
+
+      // Verify undo & redo work identically after sendAgentChat mutation
+      assert(bridge.undo() === true, `Undo succeeds in ${mode} mode after AI mutation`);
+      assert(
+        stateManager.exportCurrent().smiles === "CC=O" || stateManager.exportCurrent().smiles === "O=CC",
+        `Undo in ${mode} mode restores Acetaldehyde`
+      );
+      assert(bridge.redo() === true, `Redo succeeds in ${mode} mode`);
+      assert(stateManager.exportCurrent().smiles === "CCO", `Redo in ${mode} mode restores Ethanol (CCO)`);
+    } finally {
+      unregister();
+    }
+  }
+}
+
+console.log(`--- ChemAI Agent Handshake Tests: ${passed} passed, 0 failed ---`);
 console.log("--- All ChemAI Agent Handshake Tests Passed Successfully! ---");

@@ -39,7 +39,7 @@ function inferClientErrorType(res) {
  * @param {object} params - Action parameters
  * @returns {Promise<{ok: boolean, data?: object, error?: string, errorType?: string, unavailable?: boolean, cancelled?: boolean, needsApproval?: boolean}>}
  */
-export async function executeClientTool(actionName, params = {}) {
+export async function executeClientTool(actionName, params = {}, actionId = null) {
   // 1. Strict allowlist validation
   if (typeof actionName !== "string" || !ALLOWED_BRIDGE_ACTIONS.includes(actionName)) {
     return {
@@ -62,7 +62,18 @@ export async function executeClientTool(actionName, params = {}) {
 
   // 3. Execution through bridge
   try {
-    const res = await bridge.executeAction(actionName, params);
+    const effectiveParams =
+      (actionName === "change_bond_order" || actionName === "mutate_editor_structure") &&
+      params &&
+      typeof params === "object" &&
+      !Array.isArray(params) &&
+      params.actionId === undefined &&
+      typeof actionId === "string" &&
+      actionId.trim()
+        ? { ...params, actionId: actionId.trim() }
+        : params;
+
+    const res = await bridge.executeAction(actionName, effectiveParams);
     if (!res || typeof res !== "object") {
       return {
         ok: false,
@@ -79,6 +90,19 @@ export async function executeClientTool(actionName, params = {}) {
       error: res.error,
       ...(ok ? {} : { errorType: inferClientErrorType(res) }),
       ...(unavailable ? { unavailable: true } : {}),
+      ...(res.actionId !== undefined ? { actionId: res.actionId } : {}),
+      ...(res.operation !== undefined ? { operation: res.operation } : {}),
+      ...(res.status !== undefined ? { status: res.status } : {}),
+      ...(res.rejected !== undefined ? { rejected: Boolean(res.rejected) } : {}),
+      ...(res.validationFailed !== undefined ? { validationFailed: Boolean(res.validationFailed) } : {}),
+      ...(res.interrupted !== undefined ? { interrupted: Boolean(res.interrupted) } : {}),
+      ...(res.duplicate !== undefined ? { duplicate: Boolean(res.duplicate) } : {}),
+      ...(res.actionState !== undefined ? { actionState: res.actionState } : {}),
+      ...(res.revision !== undefined ? { revision: res.revision } : {}),
+      ...(res.previousRevision !== undefined ? { previousRevision: res.previousRevision } : {}),
+      ...(res.summary !== undefined ? { summary: res.summary } : {}),
+      ...(res.validationErrors !== undefined ? { validationErrors: res.validationErrors } : {}),
+      ...(res.failureCode !== undefined ? { failureCode: res.failureCode } : {}),
       needsApproval: Boolean(res.needsApproval),
       cancelled,
     };
@@ -154,7 +178,7 @@ export async function sendAgentChat({
         action: { id, tool, arguments: actionArgs },
       });
 
-      const clientResult = await executeClientTool(tool, actionArgs);
+      const clientResult = await executeClientTool(tool, actionArgs, id);
 
       onStatusChange?.({
         status: "action_completed",
