@@ -1175,4 +1175,300 @@ console.log("--- Starting ChemAI Agent Molecular Editor Handshake Tests (Phase 2
   }
 }
 
+/* 22. Phase 2C: OpenRouter Rate-Limit (HTTP 429) & Network Connection Resets */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // 22a. HTTP 429 rate limit
+  const rateLimitFetch = async (url) => {
+    if (String(url).includes("/endpoints")) {
+      return new Response(JSON.stringify({ data: { endpoints: [{ supported_parameters: ["tools"] }] } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ error: { message: "Rate limit exceeded. Please wait." } }), { status: 429 });
+  };
+  const fallbackCallAI429 = async () => ({
+    text: "fallback answer",
+    provider: "chemai-assistant",
+    model: "test/model",
+    diagnostics: [{ type: AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, detail: "OpenRouter HTTP 429" }],
+  });
+
+  let rateLimitErr = null;
+  try {
+    await runAgent({
+      message: "Draw aspirin",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: fallbackCallAI429,
+      fetchImpl: rateLimitFetch,
+    });
+  } catch (err) {
+    rateLimitErr = err;
+  }
+  assert(rateLimitErr instanceof AgentError, "HTTP 429 rate limit throws structured AgentError");
+  assert(rateLimitErr.type === AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, "Rate limit surfaces ai_provider_unavailable");
+  assert(rateLimitErr.status === 502, "Status code is 502 for rate limit");
+
+  // 22b. Network interruption / connection reset
+  const networkErrFetch = async (url) => {
+    if (String(url).includes("/endpoints")) {
+      return new Response(JSON.stringify({ data: { endpoints: [{ supported_parameters: ["tools"] }] } }), { status: 200 });
+    }
+    const err = new TypeError("fetch failed: ECONNRESET");
+    throw err;
+  };
+
+  let netCaught = null;
+  try {
+    await runAgent({
+      message: "Draw aspirin",
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: fallbackCallAI429,
+      fetchImpl: networkErrFetch,
+    });
+  } catch (err) {
+    netCaught = err;
+  }
+  assert(netCaught instanceof AgentError, "Network connection reset throws structured AgentError");
+  assert(netCaught.type === AGENT_ERROR_TYPES.AI_PROVIDER_UNAVAILABLE, "Network reset surfaces ai_provider_unavailable");
+  assert(/drawing was not changed/i.test(netCaught.message), "Network failure confirms drawing was not changed");
+}
+
+/* 23. Phase 2C: Malformed Tool-Call Format from Model */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // Model emits tool call with unparseable JSON arguments
+  const malformedToolCall = {
+    content: null,
+    tool_calls: [
+      {
+        id: "call_malformed_1",
+        type: "function",
+        function: {
+          name: "load_structure_into_editor",
+          arguments: "{ this is definitely not valid json : ; }",
+        },
+      },
+    ],
+  };
+
+  const { fetchImpl } = mockOpenRouter([
+    malformedToolCall,
+    { content: "The tool call arguments were malformed JSON, so I did not alter your canvas." },
+  ]);
+
+  const res = await runAgent({
+    message: "Load a broken structure",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl,
+  });
+
+  assert(res.status !== "action_required", "Malformed JSON tool call does not suspend for client execution");
+  assert(res.agent.toolCalls[0].rejected === true, "Malformed JSON tool call is rejected");
+  assert(/not valid JSON/i.test(res.agent.toolCalls[0].error), "Rejection specifies invalid JSON arguments");
+}
+
+/* 24. Phase 2C: Loading into Empty Canvas Bypasses Approval; Populated Canvas Enforces Approval */
+{
+  // Target with 0 atoms (empty canvas)
+  let storedMol = { atoms: [], bonds: [] };
+  let approvalWasRequested = false;
+
+  const emptyTarget = {
+    isReady: () => true,
+    getViewMode: () => "desktop",
+    getMolecule: () => storedMol,
+    exportCurrent: () => ({ smiles: "", formula: "", weight: "" }),
+    requestApproval: async () => {
+      approvalWasRequested = true;
+      return true;
+    },
+    loadSmiles: (s) => {
+      storedMol = { atoms: [{ id: "c1", element: "C", x: 0, y: 0 }], bonds: [] };
+    },
+  };
+
+  const bridge = createEditorBridge(emptyTarget);
+  const unregister = registerEditorBridge(bridge);
+
+  try {
+    // 24a. Empty canvas load -> direct execution, no approval modal needed
+    const loadEmptyRes = await executeClientTool("load_structure_into_editor", { smiles: "CCO" });
+    assert(loadEmptyRes.ok === true, "Loading into empty canvas succeeds directly");
+    assert(approvalWasRequested === false, "No replacement approval requested for empty canvas");
+    assert(storedMol.atoms.length === 1, "Molecule loaded onto previously empty canvas");
+
+    // 24b. Populated canvas load -> approval MUST be requested
+    approvalWasRequested = false;
+    const loadPopulatedRes = await executeClientTool("load_structure_into_editor", { smiles: "c1ccccc1" });
+    assert(loadPopulatedRes.ok === true, "Approved replacement of populated canvas succeeds");
+    assert(approvalWasRequested === true, "Approval was requested before replacing non-empty structure");
+  } finally {
+    unregister();
+  }
+}
+
+/* 25. Phase 2C: User Approving Replacement — Truthful Confirmation & Canvas Framing */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // Model requests load_structure_into_editor
+  const { fetchImpl: f1 } = mockOpenRouter([
+    toolCall("c_load_approved", "load_structure_into_editor", { smiles: "c1ccccc1" }),
+  ]);
+
+  const suspended = await runAgent({
+    message: "Draw benzene in my editor",
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: f1,
+  });
+
+  assert(suspended.status === "action_required", "Suspends for user approval");
+
+  // Client confirms replacement approved and completed
+  const { fetchImpl: f2 } = mockOpenRouter([
+    { content: "I have replaced your canvas with Benzene (c1ccccc1) and centered the view." },
+  ]);
+
+  const completed = await runAgent({
+    continuationToken: suspended.continuationToken,
+    clientActionResult: {
+      id: suspended.actionRequest.id,
+      tool: suspended.actionRequest.tool,
+      result: {
+        ok: true,
+        data: {
+          smiles: "c1ccccc1",
+          formula: "C6H6",
+          atomCount: 6,
+          bondCount: 6,
+          viewMode: "desktop",
+          viewport: { zoom: 1.6 },
+        },
+      },
+    },
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl: f2,
+  });
+
+  assert(completed.agent.iterations === 1, "Completed in 1 handshake turn");
+  assert(completed.agent.toolCalls[0].ok === true, "Tool call recorded as ok: true in trace");
+  assert(completed.reply.includes("replaced your canvas with Benzene"), "Final answer truthfully confirms approved replacement");
+}
+
+/* 26. Phase 2C: Continuation Payload Integrity & Validation */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // 26a. Missing clientActionResult
+  const validToken = createContinuationToken({
+    sessionId: "sess_test",
+    message: "Inspect canvas",
+    pendingCall: { id: "p_call_1", name: "read_editor_structure", parsedArguments: {} },
+  });
+
+  let missingResCaught = null;
+  try {
+    await runAgent({
+      continuationToken: validToken,
+      clientActionResult: null,
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+    });
+  } catch (err) {
+    missingResCaught = err;
+  }
+  assert(missingResCaught instanceof AgentError, "Missing clientActionResult throws AgentError");
+  assert(missingResCaught.type === AGENT_ERROR_TYPES.INVALID_CONTINUATION, "Error type is invalid_continuation");
+  assert(missingResCaught.status === 400, "Status is 400 for missing clientActionResult");
+
+  // 26b. Mismatched tool name
+  let mismatchedToolCaught = null;
+  try {
+    await runAgent({
+      continuationToken: validToken,
+      clientActionResult: { id: "p_call_1", tool: "load_structure_into_editor", result: { ok: true } },
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+    });
+  } catch (err) {
+    mismatchedToolCaught = err;
+  }
+  assert(mismatchedToolCaught instanceof AgentError, "Mismatched tool name throws AgentError");
+  assert(mismatchedToolCaught.type === AGENT_ERROR_TYPES.INVALID_CONTINUATION, "Mismatched tool is invalid_continuation");
+
+  // 26c. Corrupted continuation token
+  let corruptedCaught = null;
+  try {
+    await runAgent({
+      continuationToken: "not_valid_base64_json_payload!",
+      clientActionResult: { id: "p1", tool: "read_editor_structure", result: { ok: true } },
+      env: ENV,
+      registry: createToolRegistry(handlers),
+      callAI: noCallAI,
+    });
+  } catch (err) {
+    corruptedCaught = err;
+  }
+  assert(corruptedCaught instanceof AgentError, "Corrupted token throws AgentError");
+  assert(corruptedCaught.type === AGENT_ERROR_TYPES.INVALID_CONTINUATION, "Corrupted token surfaces invalid_continuation");
+}
+
+/* 27. Phase 2C: Replayed Action Identifiers & Repeated Continuation Submissions */
+{
+  _resetCapabilityCache();
+  const { handlers } = mockHandlers();
+
+  // Create token with already completed failed action
+  const tokenWithFailedAction = createContinuationToken({
+    sessionId: "sess_dup",
+    message: "Draw benzene",
+    steps: [
+      {
+        turn: 1,
+        id: "call_benzene_1",
+        name: "load_structure_into_editor",
+        parsedArguments: { smiles: "c1ccccc1" },
+        result: { ok: false, errorType: AGENT_ERROR_TYPES.REPLACEMENT_REJECTED, error: "Declined" },
+      },
+    ],
+    pendingCall: { id: "call_benzene_2", name: "load_structure_into_editor", parsedArguments: { smiles: "c1ccccc1" } },
+  });
+
+  // Client attempts to submit action result for already failed signature
+  const { fetchImpl } = mockOpenRouter([
+    { content: "You declined the replacement earlier, so I did not modify your canvas." },
+  ]);
+
+  const res = await runAgent({
+    continuationToken: tokenWithFailedAction,
+    clientActionResult: {
+      id: "call_benzene_2",
+      tool: "load_structure_into_editor",
+      result: { ok: false, errorType: AGENT_ERROR_TYPES.REPLACEMENT_REJECTED, error: "Declined" },
+    },
+    env: ENV,
+    registry: createToolRegistry(handlers),
+    callAI: noCallAI,
+    fetchImpl,
+  });
+
+  assert(res.agent.toolCalls[0].rejected === true, "Repeated submission of failed action marked rejected");
+  assert(res.reply.includes("declined"), "Agent communicates truthful outcome without duplicating mutation");
+}
+
 console.log("--- All ChemAI Agent Handshake Tests Passed Successfully! ---");
